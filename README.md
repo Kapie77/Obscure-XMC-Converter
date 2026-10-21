@@ -1,7 +1,7 @@
 # Obscure XMC Converter
 .xmc to .xml and .xml to .xmc converter for Obscure 1 and Obscure.
 
-# Como compilar
+# How to Compile
 Install Rust using rustup, and in that folder, run:
 
 ```powershell
