@@ -11,7 +11,7 @@ cargo build --release
 
 The executable will be located in:
 
-`target\release\xmc-rust-converter.exe`
+`target\release\obscure-xmc-converter.exe`
 
 ## Linux
 **Install Rust**
@@ -41,7 +41,7 @@ cargo build --release
 
 The executable will be located in:
 
-`target/release/xmc-rust-converter`
+`target/release/obscure-xmc-converter`
 
 ## Use via terminal
 ```powershell
