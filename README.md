@@ -10,6 +10,7 @@ cargo build --release
 ```
 
 The executable will be located in:
+
 `target\release\xmc-rust-converter.exe`
 
 ## Linux
