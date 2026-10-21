@@ -14,8 +14,8 @@ The executable will be located in:
 
 ## Linux
 1. Install Rust
-```bash
 Open the terminal and run:
+```bash
 sudo apt update
 sudo apt install build-essential curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
