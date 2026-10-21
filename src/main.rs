@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand};
 use crc32fast::Hasher;
 use serde_json::Value;
 use std::{
@@ -13,28 +13,60 @@ const NODE_SIZE: usize = 16;
 const ATTR_SIZE: usize = 8;
 
 #[derive(Parser, Debug)]
-#[command(name = "obscure-xmc-converter", about = "Convert between Obscure 2 XMC and XML")]
+#[command(
+    name = "obscure-xmc-converter",
+    version,
+    about = "Convert between Obscure 2 XMC and XML",
+    long_about = "Extract XMC files to XML or build XMC files from XML."
+)]
 struct Args {
-    /// Input files (.xmc or .xml); multiple files are supported
-    #[arg(required = true)]
-    inputs: Vec<PathBuf>,
-    /// Output file for one input, or output directory for multiple inputs
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-    /// Conversion mode (auto detects from file extensions)
-    #[arg(long, value_enum, default_value_t = Mode::Auto)]
-    mode: Mode,
-    /// CRC dictionary (JSON or newline-separated text)
-    #[arg(long = "dict")]
-    dict_file: Option<PathBuf>,
-    /// Print additional binary information
-    #[arg(long)]
-    debug: bool,
+    #[command(subcommand)]
+    command: Command,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Extract an XMC file to XML
+    Extract {
+        /// Input XMC files
+        #[arg(required = true, value_name = "INPUT")]
+        inputs: Vec<PathBuf>,
+
+        /// Output file for one input, or output directory for multiple inputs
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// CRC dictionary JSON or text file
+        #[arg(long = "dict")]
+        dict_file: Option<PathBuf>,
+
+        /// Print additional binary information
+        #[arg(long)]
+        debug: bool,
+    },
+
+    /// Build an XMC file from XML
+    Build {
+        /// Input XML files
+        #[arg(required = true, value_name = "INPUT")]
+        inputs: Vec<PathBuf>,
+
+        /// Output file for one input, or output directory for multiple inputs
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// CRC dictionary JSON or text file
+        #[arg(long = "dict")]
+        dict_file: Option<PathBuf>,
+
+        /// Print additional binary information
+        #[arg(long)]
+        debug: bool,
+    },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Mode {
-    Auto,
     Xmc2xml,
     Xml2xmc,
 }
@@ -457,70 +489,195 @@ fn output_path(source: &Path, mode: Mode, override_path: Option<&Path>, batch: b
     out.to_path_buf()
 }
 
+
+fn parse_args_with_implicit_mode() -> Args {
+    use std::ffi::OsString;
+
+    let raw: Vec<OsString> = std::env::args_os().collect();
+
+    let first = raw.get(1).and_then(|arg| arg.to_str());
+
+    // Preserve explicit commands and normal help/version requests.
+    if matches!(
+        first,
+        Some("extract" | "build" | "--help" | "-h" | "--version" | "-V")
+    ) {
+        return Args::parse_from(raw);
+    }
+
+    let mut xmc_count = 0usize;
+    let mut xml_count = 0usize;
+    let mut skip_next = false;
+
+    for arg in raw.iter().skip(1) {
+        let Some(value) = arg.to_str() else {
+            continue;
+        };
+
+        // These options take a value that must not be treated as input.
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        if matches!(value, "--dict" | "-o" | "--output") {
+            skip_next = true;
+            continue;
+        }
+
+        // Also support --dict=... and --output=...
+        if value.starts_with("--dict=")
+            || value.starts_with("--output=")
+            || value.starts_with("-o=")
+        {
+            continue;
+        }
+
+        // Ignore other command-line options.
+        if value.starts_with('-') {
+            continue;
+        }
+
+        let extension = std::path::Path::new(value)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        match extension.as_str() {
+            "xmc" => xmc_count += 1,
+            "xml" => xml_count += 1,
+            _ => {}
+        }
+    }
+
+    if xmc_count == 0 && xml_count == 0 {
+        eprintln!(
+            "No .xmc or .xml input detected. \
+             Use 'extract' for XMC files or 'build' for XML files."
+        );
+        std::process::exit(2);
+    }
+
+    // Preserve the old automatic behavior: XMC wins a tie.
+    let command = if xml_count > xmc_count {
+        "build"
+    } else {
+        "extract"
+    };
+
+    let mut forwarded = Vec::with_capacity(raw.len() + 1);
+    forwarded.push(raw[0].clone());
+    forwarded.push(command.into());
+    forwarded.extend(raw.into_iter().skip(1));
+
+    Args::parse_from(forwarded)
+}
+
 fn main() -> Result<()> {
-    let args = Args::parse();
-    let dict_path = args.dict_file.clone().or_else(resolve_default_dict);
+    let args = parse_args_with_implicit_mode();
+
+    let (inputs, output, dict_file, debug, mode) = match args.command {
+        Command::Extract {
+            inputs,
+            output,
+            dict_file,
+            debug,
+        } => (inputs, output, dict_file, debug, Mode::Xmc2xml),
+
+        Command::Build {
+            inputs,
+            output,
+            dict_file,
+            debug,
+        } => (inputs, output, dict_file, debug, Mode::Xml2xmc),
+    };
+
+    let dict_path = dict_file.or_else(resolve_default_dict);
+
     let dict = match dict_path {
         Some(path) => load_crc_dictionary(&path)
             .with_context(|| format!("Failed to load dictionary {}", path.display()))?,
         None => {
-            eprintln!("Warning: hashes.json not found; unknown names will use CRC32.");
+            eprintln!(
+                "Warning: hashes.json not found; unknown names will use CRC32."
+            );
             HashMap::new()
         }
     };
 
-    let mut xmc = Vec::new();
-    let mut xml = Vec::new();
+    let expected_extension = match mode {
+        Mode::Xmc2xml => "xmc",
+        Mode::Xml2xmc => "xml",
+    };
+
+    let mut sources = Vec::new();
     let mut ignored = Vec::new();
     let mut missing = Vec::new();
 
-    for path in &args.inputs {
+    for path in &inputs {
         if !path.exists() {
             missing.push(path.clone());
             continue;
         }
-        match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
-            "xmc" => xmc.push(path.clone()),
-            "xml" => xml.push(path.clone()),
-            _ => ignored.push(path.clone()),
+
+        let extension = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if extension == expected_extension {
+            sources.push(path.clone());
+        } else {
+            ignored.push(path.clone());
         }
     }
 
-    for path in missing { eprintln!("Skipping missing file: {}", path.display()); }
-    for path in ignored { eprintln!("Ignoring unsupported file: {}", path.display()); }
-
-    let mode = match args.mode {
-        Mode::Auto => if xmc.len() >= xml.len() { Mode::Xmc2xml } else { Mode::Xml2xmc },
-        other => other,
-    };
-    let sources = match mode {
-        Mode::Xmc2xml => &xmc,
-        Mode::Xml2xmc => &xml,
-        Mode::Auto => unreachable!(),
-    };
-    let incompatible = match mode {
-        Mode::Xmc2xml => &xml,
-        Mode::Xml2xmc => &xmc,
-        Mode::Auto => unreachable!(),
-    };
-    if sources.is_empty() {
-        bail!("No compatible input files found for mode {mode:?}");
+    for path in missing {
+        eprintln!("Skipping missing file: {}", path.display());
     }
-    for path in incompatible {
-        eprintln!("Skipping incompatible file for {mode:?}: {}", path.display());
+
+    for path in ignored {
+        eprintln!(
+            "Ignoring file with unsupported extension for this command: {}",
+            path.display()
+        );
+    }
+
+    if sources.is_empty() {
+        bail!(
+            "No compatible input files found. Expected .{expected_extension} files."
+        );
     }
 
     let batch = sources.len() > 1;
-    for source in sources {
-        let destination = output_path(source, mode, args.output.as_deref(), batch);
+
+    for source in &sources {
+        let destination = output_path(
+            source,
+            mode,
+            output.as_deref(),
+            batch,
+        );
+
         match mode {
-            Mode::Xmc2xml => xmc_to_xml(source, &destination, &dict, args.debug)?,
-            Mode::Xml2xmc => xml_to_xmc(source, &destination, &dict, args.debug)?,
-            Mode::Auto => unreachable!(),
+            Mode::Xmc2xml => {
+                xmc_to_xml(source, &destination, &dict, debug)?;
+            }
+            Mode::Xml2xmc => {
+                xml_to_xmc(source, &destination, &dict, debug)?;
+            }
         }
     }
+
     if batch {
-        println!("Processed {} files in mode {mode:?}", sources.len());
+        println!(
+            "Processed {} files in mode {:?}",
+            sources.len(),
+            mode
+        );
     }
+
     Ok(())
 }
