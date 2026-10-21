@@ -1,5 +1,5 @@
 # Obscure XMC Converter
-.xmc to .xml and .xml to .xmc converter for Obscure 1 and Obscure.
+A tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 1 and Obscure 2.
 
 # How to Compile
 Install Rust using rustup, and in that folder, run:
