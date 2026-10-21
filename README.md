@@ -14,6 +14,7 @@ The executable will be located in:
 
 ## Linux
 1. Install Rust
+
 Open the terminal and run:
 ```bash
 sudo apt update
