@@ -13,7 +13,7 @@ The executable will be located in:
 `target\release\xmc-rust-converter.exe`
 
 ## Linux
-1. Install Rust
+**Install Rust**
 
 Open the terminal and run:
 ```bash
@@ -33,7 +33,7 @@ rustc --version
 cargo --version
 ```
 
-2. Compile the project
+**Compile the project**
 ```bash
 cargo build --release
 ```
