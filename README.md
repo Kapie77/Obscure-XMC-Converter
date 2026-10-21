@@ -44,13 +44,23 @@ The executable will be located in:
 `target/release/obscure-xmc-converter`
 
 ## Use via terminal
-```powershell
-cargo run --release -- "C:\Folder\file.xmc"
-cargo run --release -- "C:\Folder\file.xml"
-cargo run --release -- --dict "C:\Folder\hashes.json" "file.xmc"
-cargo run --release -- --mode xmc2xml "file.xmc"
-cargo run --release -- --mode xml2xmc "file.xml"
-cargo run --release -- --debug "file.xmc"
+**Windows**
+```bash
+obscure-xmc-converter.exe extract filename.xmc
+obscure-xmc-converter.exe build filename.xml
+```
+
+**Linux**
+```bash
+obscure-xmc-converter extract filename.xmc
+obscure-xmc-converter build filename.xml
+```
+
+or
+
+```bash
+./obscure-xmc-converter extract filename.xmc
+./obscure-xmc-converter build filename.xml
 ```
 
 For multiple files of the same type, enclose all paths in quotes. Use the `-o` option to specify an output folder:
