@@ -63,12 +63,6 @@ or
 ./obscure-xmc-converter build filename.xml
 ```
 
-For multiple files of the same type, enclose all paths in quotes. Use the `-o` option to specify an output folder:
-
-```powershell
-cargo run --release -- "a.xmc" "b.xmc" -o "C:\Converted XMC"
-```
-
 ## Notes
 
 - The binary format is treated as little-endian, with a 12-byte header, 16-byte node records, and 8-byte attributes.
