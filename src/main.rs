@@ -13,7 +13,7 @@ const NODE_SIZE: usize = 16;
 const ATTR_SIZE: usize = 8;
 
 #[derive(Parser, Debug)]
-#[command(name = "xmc-rust-converter", about = "Convert between Obscure 2 XMC and XML")]
+#[command(name = "obscure-xmc-converter", about = "Convert between Obscure 2 XMC and XML")]
 struct Args {
     /// Input files (.xmc or .xml); multiple files are supported
     #[arg(required = true)]
