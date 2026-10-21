@@ -2,17 +2,43 @@
 A tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 1 and Obscure 2.
 
 # How to Compile
-Install Rust using rustup, and in that folder, run:
+## Windows
+Install Rust, and in that folder, run:
 
 ```powershell
 cargo build --release
 ```
 
 The executable will be located in:
+`target\release\xmc-rust-converter.exe`
 
-`target\release\xmc-rust-converter.exe` (Windows)
+## Linux
+1. Install Rust
+```bash
+Open the terminal and run:
+sudo apt update
+sudo apt install build-essential curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
 
-`target/release/xmc-rust-converter` (Linux)
+Follow the installer's instructions. Then, load the Rust environment:
+```bash
+source "$HOME/.cargo/env"
+``
+
+Check to see if it's installed:
+```bash
+rustc --version
+cargo --version
+```
+
+2. Compile the project
+```bash
+cargo build --release
+```
+
+The executable will be located in:
+`target/release/xmc-rust-converter`
 
 ## Use via terminal
 ```powershell
