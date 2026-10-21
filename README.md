@@ -25,7 +25,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 Follow the installer's instructions. Then, load the Rust environment:
 ```bash
 source "$HOME/.cargo/env"
-``
+```
 
 Check to see if it's installed:
 ```bash
