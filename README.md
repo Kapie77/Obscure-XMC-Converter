@@ -1,5 +1,5 @@
 # Obscure XMC Converter
-A CLI tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 1 and Obscure 2.
+A CLI tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 2.
 
 # How to Compile
 ## Windows
