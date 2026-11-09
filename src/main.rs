@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crc32fast::Hasher;
 use serde_json::Value;
 use std::{
@@ -11,6 +11,138 @@ use xmltree::{Element, EmitterConfig, XMLNode};
 
 const NODE_SIZE: usize = 16;
 const ATTR_SIZE: usize = 8;
+
+/// CRC of the unnamed attribute that holds the glyph character of a `<char>` node.
+/// (hashes.json does not name it, so it shows up as `attr_0BB5AC54`.)
+const FONT_CHAR_VALUE_CRC: u32 = 0x0BB5_AC54;
+
+/// Text encoding used for the string pool.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum TextEncoding {
+    /// Decode UTF-8 when the bytes are valid UTF-8, otherwise CP1252.
+    /// Encode as CP1252 when possible, otherwise UTF-8.
+    Auto,
+    /// Always decode and encode CP1252 (the encoding used by the game data).
+    Cp1252,
+    /// Always decode and encode UTF-8.
+    Utf8,
+}
+
+mod text {
+    use super::TextEncoding;
+
+    /// CP1252 code points for bytes 0x80..=0x9F. The five bytes CP1252 leaves
+    /// undefined (0x81, 0x8D, 0x8F, 0x90, 0x9D) map to themselves so that
+    /// decoding is lossless.
+    const CP1252_HIGH: [u32; 32] = [
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
+        0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+    ];
+
+    pub fn cp1252_decode(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        for &b in bytes {
+            let cp = if (0x80..=0x9F).contains(&b) {
+                CP1252_HIGH[(b - 0x80) as usize]
+            } else {
+                b as u32
+            };
+            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+        }
+        out
+    }
+
+    fn cp1252_encode(s: &str) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(s.len());
+        for ch in s.chars() {
+            let cp = ch as u32;
+            let byte = if cp < 0x80 || (0xA0..=0xFF).contains(&cp) {
+                cp as u8
+            } else {
+                (0x80 + CP1252_HIGH.iter().position(|&c| c == cp)?) as u8
+            };
+            out.push(byte);
+        }
+        Some(out)
+    }
+
+    pub fn decode(bytes: &[u8], mode: TextEncoding) -> String {
+        match mode {
+            TextEncoding::Utf8 => escape_controls(&String::from_utf8_lossy(bytes)),
+            TextEncoding::Cp1252 => escape_controls(&cp1252_decode(bytes)),
+            TextEncoding::Auto => match std::str::from_utf8(bytes) {
+                Ok(s) => escape_controls(s),
+                Err(_) => escape_controls(&cp1252_decode(bytes)),
+            },
+        }
+    }
+
+    /// XML 1.0 cannot represent C0 control characters (other than tab, LF and
+    /// CR), so they are written as `\u0012`-style escapes and restored on build.
+    fn is_xml_illegal(ch: char) -> bool {
+        let c = ch as u32;
+        c < 0x20 && c != 0x09 && c != 0x0A && c != 0x0D
+    }
+
+    fn escape_controls(s: &str) -> String {
+        if !s.chars().any(is_xml_illegal) {
+            return s.to_owned();
+        }
+        let mut out = String::with_capacity(s.len() + 8);
+        for ch in s.chars() {
+            if is_xml_illegal(ch) {
+                out.push_str(&format!("\\u{:04X}", ch as u32));
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    fn unescape_controls(s: &str) -> String {
+        if !s.contains("\\u") {
+            return s.to_owned();
+        }
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 5 < chars.len() && chars[i + 1] == 'u' {
+                let hex: String = chars[i + 2..i + 6].iter().collect();
+                if let Ok(value) = u32::from_str_radix(&hex, 16) {
+                    if value < 0x20 {
+                        if let Some(ch) = char::from_u32(value) {
+                            out.push(ch);
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    }
+
+    pub fn encode(s: &str, mode: TextEncoding) -> Vec<u8> {
+        let s = unescape_controls(s);
+        let s = s.as_str();
+        if mode != TextEncoding::Utf8 {
+            // The shipped font files store U+2122 (TM) as 0x84 0xA2, i.e. the
+            // UTF-8 sequence E2 84 A2 with its lead byte missing. Reproduce the
+            // game's own bytes so a rebuild stays byte-identical.
+            if s == "\u{2122}" {
+                return vec![0x84, 0xA2];
+            }
+            if let Some(bytes) = cp1252_encode(s) {
+                return bytes;
+            }
+        }
+        s.as_bytes().to_vec()
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,6 +172,10 @@ enum Command {
         #[arg(long = "dict")]
         dict_file: Option<PathBuf>,
 
+        /// String pool encoding
+        #[arg(long, value_enum, default_value_t = TextEncoding::Auto)]
+        encoding: TextEncoding,
+
         /// Print additional binary information
         #[arg(long)]
         debug: bool,
@@ -58,6 +194,15 @@ enum Command {
         /// CRC dictionary JSON or text file
         #[arg(long = "dict")]
         dict_file: Option<PathBuf>,
+
+        /// String pool encoding
+        #[arg(long, value_enum, default_value_t = TextEncoding::Auto)]
+        encoding: TextEncoding,
+
+        /// Reuse an identical string that is already in the pool. The shipped
+        /// files store one copy per attribute, so this is off by default.
+        #[arg(long)]
+        dedup: bool,
 
         /// Print additional binary information
         #[arg(long)]
@@ -189,14 +334,45 @@ fn resolve_name(crc: u32, dict: &HashMap<u32, String>, prefix: &str) -> String {
     dict.get(&crc).cloned().unwrap_or_else(|| format!("{prefix}_{crc:08X}"))
 }
 
-fn pool_string(pool: &[u8], offset: u32) -> String {
+fn pool_bytes(pool: &[u8], offset: u32) -> &[u8] {
     let start = offset as usize;
     if start >= pool.len() {
-        return String::new();
+        return &[];
     }
     let end = pool[start..].iter().position(|b| *b == 0)
         .map(|n| start + n).unwrap_or(pool.len());
-    String::from_utf8_lossy(&pool[start..end]).into_owned()
+    &pool[start..end]
+}
+
+/// The `<char>` glyph value is a copy of the glyph character, but some shipped
+/// font files store characters above U+07FF as the UTF-8 sequence with the lead
+/// byte stripped (U+2122 is stored as `84 A2` instead of `E2 84 A2`). When the
+/// stored bytes are exactly the tail of the UTF-8 encoding of the node's `code`
+/// attribute, the code point is authoritative and is used instead.
+fn repair_char_value(raw: &[u8], decoded: String, code: Option<u32>) -> String {
+    let Some(code) = code else {
+        return decoded;
+    };
+    if decoded.chars().count() == 1 {
+        return decoded;
+    }
+    let Some(ch) = char::from_u32(code) else {
+        return decoded;
+    };
+    let mut buf = [0u8; 4];
+    let utf8 = ch.encode_utf8(&mut buf).as_bytes();
+    if utf8.len() > 2 && raw == &utf8[1..] {
+        return ch.to_string();
+    }
+    decoded
+}
+
+fn node_code(raw_attrs: &[(u32, &[u8])]) -> Option<u32> {
+    let code_crc = crc32("code");
+    raw_attrs.iter()
+        .find(|(crc, _)| *crc == code_crc)
+        .and_then(|(_, raw)| std::str::from_utf8(raw).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
 fn element_from_node(
@@ -205,6 +381,7 @@ fn element_from_node(
     attrs: &[XmcAttribute],
     pool: &[u8],
     dict: &HashMap<u32, String>,
+    encoding: TextEncoding,
     depth: usize,
 ) -> Result<Element> {
     if depth > nodes.len() {
@@ -217,13 +394,19 @@ fn element_from_node(
         if node.first_attr < 0 {
             bail!("Node {idx} has attributes but an invalid first_attr");
         }
+        let mut raw_attrs: Vec<(u32, &[u8])> = Vec::with_capacity(node.attr_count as usize);
         for n in 0..node.attr_count as usize {
             let ai = node.first_attr as usize + n;
             let attr = attrs.get(ai).with_context(|| format!("Attribute index {ai} out of range"))?;
-            elem.attributes.insert(
-                resolve_name(attr.name_crc, dict, "attr"),
-                pool_string(pool, attr.value_offset),
-            );
+            raw_attrs.push((attr.name_crc, pool_bytes(pool, attr.value_offset)));
+        }
+        let code = node_code(&raw_attrs);
+        for (name_crc, raw) in raw_attrs {
+            let mut value = text::decode(raw, encoding);
+            if name_crc == FONT_CHAR_VALUE_CRC {
+                value = repair_char_value(raw, value, code);
+            }
+            elem.attributes.insert(resolve_name(name_crc, dict, "attr"), value);
         }
     }
 
@@ -234,14 +417,20 @@ fn element_from_node(
         for n in 0..node.child_count as usize {
             let child_idx = node.first_child as usize + n;
             elem.children.push(XMLNode::Element(element_from_node(
-                child_idx, nodes, attrs, pool, dict, depth + 1,
+                child_idx, nodes, attrs, pool, dict, encoding, depth + 1,
             )?));
         }
     }
     Ok(elem)
 }
 
-fn xmc_to_xml(input: &Path, output: &Path, dict: &HashMap<u32, String>, debug: bool) -> Result<()> {
+fn xmc_to_xml(
+    input: &Path,
+    output: &Path,
+    dict: &HashMap<u32, String>,
+    encoding: TextEncoding,
+    debug: bool,
+) -> Result<()> {
     let data = fs::read(input).with_context(|| format!("Could not read {}", input.display()))?;
     let (nodes, attrs, pool) = parse_xmc(&data)?;
     if debug {
@@ -254,7 +443,7 @@ fn xmc_to_xml(input: &Path, output: &Path, dict: &HashMap<u32, String>, debug: b
     let mut xml = Vec::new();
     xml.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     if !nodes.is_empty() {
-        let root = element_from_node(0, &nodes, &attrs, &pool, dict, 0)?;
+        let root = element_from_node(0, &nodes, &attrs, &pool, dict, encoding, 0)?;
         root.write_with_config(
             &mut xml,
             EmitterConfig::new().perform_indent(true).write_document_declaration(false),
@@ -289,6 +478,40 @@ fn validate_i16(value: usize, field: &str) -> Result<i16> {
     Ok(value as i16)
 }
 
+fn intern_value(
+    value: &str,
+    pool: &mut Vec<u8>,
+    string_offsets: &mut HashMap<String, u32>,
+    encoding: TextEncoding,
+    dedup: bool,
+) -> Result<u32> {
+    if dedup {
+        if let Some(offset) = string_offsets.get(value) {
+            return Ok(*offset);
+        }
+    }
+    let offset = u32::try_from(pool.len()).context("String pool exceeds u32 range")?;
+    pool.extend_from_slice(&text::encode(value, encoding));
+    pool.push(0);
+    if dedup {
+        string_offsets.insert(value.to_owned(), offset);
+    }
+    Ok(offset)
+}
+
+fn new_node(tag_crc: u32, parent: i16) -> XmcNode {
+    // The shipped files store 0 in the "absent" index fields (root parent,
+    // leaf first_child, node first_attr) instead of -1.
+    XmcNode {
+        tag_crc,
+        parent_idx: parent,
+        child_count: 0,
+        first_child: 0,
+        attr_count: 0,
+        first_attr: 0,
+    }
+}
+
 fn build_element(
     element: &Element,
     parent: i16,
@@ -297,28 +520,15 @@ fn build_element(
     pool: &mut Vec<u8>,
     string_offsets: &mut HashMap<String, u32>,
     reverse: &HashMap<String, u32>,
+    encoding: TextEncoding,
+    dedup: bool,
 ) -> Result<usize> {
     let idx = nodes.len();
-    nodes.push(XmcNode {
-        tag_crc: name_to_crc(&element.name, reverse),
-        parent_idx: parent,
-        child_count: 0,
-        first_child: -1,
-        attr_count: 0,
-        first_attr: -1,
-    });
+    nodes.push(new_node(name_to_crc(&element.name, reverse), parent));
 
     let first_attr = attrs.len();
     for (name, value) in &element.attributes {
-        let offset = if let Some(offset) = string_offsets.get(value) {
-            *offset
-        } else {
-            let offset = u32::try_from(pool.len()).context("String pool exceeds u32 range")?;
-            pool.extend_from_slice(value.as_bytes());
-            pool.push(0);
-            string_offsets.insert(value.clone(), offset);
-            offset
-        };
+        let offset = intern_value(value, pool, string_offsets, encoding, dedup)?;
         attrs.push(XmcAttribute { name_crc: name_to_crc(name, reverse), value_offset: offset });
     }
     let attr_count = element.attributes.len();
@@ -335,14 +545,10 @@ fn build_element(
     for child in &child_elements {
         // Reserve all siblings first so child indices stay contiguous, as XMC expects.
         let child_idx = nodes.len();
-        nodes.push(XmcNode {
-            tag_crc: name_to_crc(&child.name, reverse),
-            parent_idx: validate_i16(idx, "parent index")?,
-            child_count: 0,
-            first_child: -1,
-            attr_count: 0,
-            first_attr: -1,
-        });
+        nodes.push(new_node(
+            name_to_crc(&child.name, reverse),
+            validate_i16(idx, "parent index")?,
+        ));
         child_indices.push(child_idx);
     }
     nodes[idx].child_count = validate_i16(child_indices.len(), "child count")?;
@@ -353,7 +559,7 @@ fn build_element(
     for (child, child_idx) in child_elements.iter().zip(child_indices.iter()) {
         // Build attributes and descendants for the already-reserved node.
         populate_reserved_child(
-            child, *child_idx, nodes, attrs, pool, string_offsets, reverse,
+            child, *child_idx, nodes, attrs, pool, string_offsets, reverse, encoding, dedup,
         )?;
     }
     Ok(idx)
@@ -367,20 +573,13 @@ fn populate_reserved_child(
     pool: &mut Vec<u8>,
     string_offsets: &mut HashMap<String, u32>,
     reverse: &HashMap<String, u32>,
+    encoding: TextEncoding,
+    dedup: bool,
 ) -> Result<()> {
-    let parent = nodes[idx].parent_idx;
     // Build this node's attributes and children in a helper, without adding another root node.
     let first_attr = attrs.len();
     for (name, value) in &element.attributes {
-        let offset = if let Some(offset) = string_offsets.get(value) {
-            *offset
-        } else {
-            let offset = u32::try_from(pool.len()).context("String pool exceeds u32 range")?;
-            pool.extend_from_slice(value.as_bytes());
-            pool.push(0);
-            string_offsets.insert(value.clone(), offset);
-            offset
-        };
+        let offset = intern_value(value, pool, string_offsets, encoding, dedup)?;
         attrs.push(XmcAttribute { name_crc: name_to_crc(name, reverse), value_offset: offset });
     }
     nodes[idx].attr_count = validate_i16(element.attributes.len(), "attribute count")?;
@@ -394,14 +593,10 @@ fn populate_reserved_child(
     let mut indices = Vec::new();
     for child in &children {
         let child_idx = nodes.len();
-        nodes.push(XmcNode {
-            tag_crc: name_to_crc(&child.name, reverse),
-            parent_idx: validate_i16(idx, "parent index")?,
-            child_count: 0,
-            first_child: -1,
-            attr_count: 0,
-            first_attr: -1,
-        });
+        nodes.push(new_node(
+            name_to_crc(&child.name, reverse),
+            validate_i16(idx, "parent index")?,
+        ));
         indices.push(child_idx);
     }
     nodes[idx].child_count = validate_i16(indices.len(), "child count")?;
@@ -409,13 +604,19 @@ fn populate_reserved_child(
         nodes[idx].first_child = validate_i16(*first, "first child index")?;
     }
     for (child, child_idx) in children.iter().zip(indices.iter()) {
-        populate_reserved_child(child, *child_idx, nodes, attrs, pool, string_offsets, reverse)?;
+        populate_reserved_child(child, *child_idx, nodes, attrs, pool, string_offsets, reverse, encoding, dedup)?;
     }
-    let _ = parent;
     Ok(())
 }
 
-fn xml_to_xmc(input: &Path, output: &Path, dict: &HashMap<u32, String>, debug: bool) -> Result<()> {
+fn xml_to_xmc(
+    input: &Path,
+    output: &Path,
+    dict: &HashMap<u32, String>,
+    encoding: TextEncoding,
+    dedup: bool,
+    debug: bool,
+) -> Result<()> {
     let file = fs::File::open(input).with_context(|| format!("Could not open {}", input.display()))?;
     let root = Element::parse(file).with_context(|| format!("Could not parse XML {}", input.display()))?;
 
@@ -430,7 +631,7 @@ fn xml_to_xmc(input: &Path, output: &Path, dict: &HashMap<u32, String>, debug: b
     let mut string_offsets = HashMap::new();
 
     build_element(
-        &root, -1, &mut nodes, &mut attrs, &mut pool, &mut string_offsets, &reverse,
+        &root, 0, &mut nodes, &mut attrs, &mut pool, &mut string_offsets, &reverse, encoding, dedup,
     )?;
 
     let node_count = u32::try_from(nodes.len()).context("Too many nodes")?;
@@ -577,20 +778,23 @@ fn parse_args_with_implicit_mode() -> Args {
 fn main() -> Result<()> {
     let args = parse_args_with_implicit_mode();
 
-    let (inputs, output, dict_file, debug, mode) = match args.command {
+    let (inputs, output, dict_file, encoding, dedup, debug, mode) = match args.command {
         Command::Extract {
             inputs,
             output,
             dict_file,
+            encoding,
             debug,
-        } => (inputs, output, dict_file, debug, Mode::Xmc2xml),
+        } => (inputs, output, dict_file, encoding, false, debug, Mode::Xmc2xml),
 
         Command::Build {
             inputs,
             output,
             dict_file,
+            encoding,
+            dedup,
             debug,
-        } => (inputs, output, dict_file, debug, Mode::Xml2xmc),
+        } => (inputs, output, dict_file, encoding, dedup, debug, Mode::Xml2xmc),
     };
 
     let dict_path = dict_file.or_else(resolve_default_dict);
@@ -663,10 +867,10 @@ fn main() -> Result<()> {
 
         match mode {
             Mode::Xmc2xml => {
-                xmc_to_xml(source, &destination, &dict, debug)?;
+                xmc_to_xml(source, &destination, &dict, encoding, debug)?;
             }
             Mode::Xml2xmc => {
-                xml_to_xmc(source, &destination, &dict, debug)?;
+                xml_to_xmc(source, &destination, &dict, encoding, dedup, debug)?;
             }
         }
     }
