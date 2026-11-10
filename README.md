@@ -5,10 +5,10 @@ containers).
 
 ## Supported Versions
 
-| Game                     | PC | 
-|--------------------------|:------:|
-| Obscure 2                |   ✅   | 
-| Final Exam                |   ✅   |
+| Game                     | PC     | Wii     | 
+|--------------------------|:------:|---------|
+| Obscure 2                |   ✅   |   ✅   | 
+| Final Exam               |   ✅   |
 
 # How to Compile
 ## Windows
