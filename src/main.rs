@@ -20,16 +20,20 @@ const FE_MAGIC: u32 = 0x66;
 const FE_VERSION: u8 = 3;
 /// Seed mixed into the pool cipher state (`"BanI"` in little-endian).
 const FE_POOL_KEY: u32 = 0x4961_6E42;
-/// Marker written into the XML so `build` can pick the right container back.
-const FORMAT_MARKER: &str = "<!-- xmc-format: final-exam -->";
+/// Markers written into the XML so `build` can pick the right container back.
+const FE_FORMAT_MARKER: &str = "<!-- xmc-format: final-exam -->";
+const WII_FORMAT_MARKER: &str = "<!-- xmc-format: wii -->";
 
 /// Container format of an `.xmc` file.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum XmcFormat {
     /// Detect from the file when extracting, or from the XML marker when building.
     Auto,
-    /// Obscure 1/2 style container.
+    /// Obscure 1/2 style container (little-endian).
     Obscure2,
+    /// Obscure 2 on Wii: same layout as Obscure 2, but big-endian and with a
+    /// 32-bit `first_attr` instead of the trailing 16-bit padding.
+    Wii,
     /// Final Exam style container.
     FinalExam,
 }
@@ -247,6 +251,49 @@ enum Mode {
     Xml2xmc,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Endian {
+    Little,
+    Big,
+}
+
+impl Endian {
+    fn u32(self, bytes: &[u8]) -> u32 {
+        match self {
+            Endian::Little => u32::from_le_bytes(bytes.try_into().unwrap()),
+            Endian::Big => u32::from_be_bytes(bytes.try_into().unwrap()),
+        }
+    }
+
+    fn i16(self, bytes: &[u8]) -> i16 {
+        match self {
+            Endian::Little => i16::from_le_bytes(bytes.try_into().unwrap()),
+            Endian::Big => i16::from_be_bytes(bytes.try_into().unwrap()),
+        }
+    }
+
+    fn u32_bytes(self, value: u32) -> [u8; 4] {
+        match self {
+            Endian::Little => value.to_le_bytes(),
+            Endian::Big => value.to_be_bytes(),
+        }
+    }
+
+    fn i16_bytes(self, value: i16) -> [u8; 2] {
+        match self {
+            Endian::Little => value.to_le_bytes(),
+            Endian::Big => value.to_be_bytes(),
+        }
+    }
+
+    fn u16_bytes(self, value: u16) -> [u8; 2] {
+        match self {
+            Endian::Little => value.to_le_bytes(),
+            Endian::Big => value.to_be_bytes(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct XmcNode {
     tag_crc: u32,
@@ -254,7 +301,8 @@ struct XmcNode {
     child_count: i16,
     first_child: i16,
     attr_count: i16,
-    first_attr: i16,
+    /// 16-bit in Obscure 1/2 and Final Exam, 32-bit in the Wii layout.
+    first_attr: i32,
     /// Trailing `u16` padding of the 16-byte Obscure node (unused by Final Exam).
     pad: u16,
     /// Final Exam only: trailing `u32`, `0xFFFFFFFF` in every shipped file.
@@ -288,6 +336,16 @@ fn read_i16(data: &[u8], offset: usize) -> Result<i16> {
 fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
     let bytes = data.get(offset..offset + 2).context("Unexpected end of file reading u16")?;
     Ok(u16::from_le_bytes(bytes.try_into()?))
+}
+
+fn read_endian_u32(data: &[u8], offset: usize, endian: Endian) -> Result<u32> {
+    let bytes = data.get(offset..offset + 4).context("Unexpected end of file reading u32")?;
+    Ok(endian.u32(bytes))
+}
+
+fn read_endian_i16(data: &[u8], offset: usize, endian: Endian) -> Result<i16> {
+    let bytes = data.get(offset..offset + 2).context("Unexpected end of file reading i16")?;
+    Ok(endian.i16(bytes))
 }
 
 /// Final Exam string pool cipher. `decrypt` reverses the in-place transform the
@@ -339,13 +397,37 @@ fn looks_like_final_exam(data: &[u8]) -> bool {
     end == data.len()
 }
 
-fn parse_obscure2(data: &[u8]) -> Result<ParsedXmc> {
+/// Byte length the Obscure header counts describe, if they can be trusted.
+fn obscure2_declared_len(data: &[u8], endian: Endian) -> Option<usize> {
+    if data.len() < 12 {
+        return None;
+    }
+    let node_count = read_endian_u32(data, 0, endian).ok()? as usize;
+    let attr_count = read_endian_u32(data, 4, endian).ok()? as usize;
+    let string_size = read_endian_u32(data, 8, endian).ok()? as usize;
+    let end = 12usize
+        .checked_add(node_count.checked_mul(NODE_SIZE)?)?
+        .checked_add(attr_count.checked_mul(ATTR_SIZE)?)?
+        .checked_add(string_size)?;
+    if end > data.len() {
+        return None;
+    }
+    Some(end)
+}
+
+/// The Wii build of Obscure 2 stores the same container big-endian.
+fn looks_like_wii(data: &[u8]) -> bool {
+    obscure2_declared_len(data, Endian::Big) == Some(data.len())
+        && obscure2_declared_len(data, Endian::Little) != Some(data.len())
+}
+
+fn parse_obscure2(data: &[u8], endian: Endian) -> Result<ParsedXmc> {
     if data.len() < 12 {
         bail!("File is too small to contain an XMC header");
     }
-    let node_count = read_u32(data, 0)? as usize;
-    let attr_count = read_u32(data, 4)? as usize;
-    let string_size = read_u32(data, 8)? as usize;
+    let node_count = read_endian_u32(data, 0, endian)? as usize;
+    let attr_count = read_endian_u32(data, 4, endian)? as usize;
+    let string_size = read_endian_u32(data, 8, endian)? as usize;
 
     let node_bytes = node_count.checked_mul(NODE_SIZE).context("Node count overflow")?;
     let attr_bytes = attr_count.checked_mul(ATTR_SIZE).context("Attribute count overflow")?;
@@ -359,14 +441,19 @@ fn parse_obscure2(data: &[u8]) -> Result<ParsedXmc> {
     let mut nodes = Vec::with_capacity(node_count);
     for i in 0..node_count {
         let o = 12 + i * NODE_SIZE;
+        let (first_attr, pad) = match endian {
+            // The Wii build widens `first_attr` to 32 bits and drops the padding.
+            Endian::Big => (read_endian_u32(data, o + 12, endian)? as i32, 0),
+            Endian::Little => (read_endian_i16(data, o + 12, endian)? as i32, read_u16(data, o + 14)?),
+        };
         nodes.push(XmcNode {
-            tag_crc: read_u32(data, o)?,
-            parent_idx: read_i16(data, o + 4)?,
-            child_count: read_i16(data, o + 6)?,
-            first_child: read_i16(data, o + 8)?,
-            attr_count: read_i16(data, o + 10)?,
-            first_attr: read_i16(data, o + 12)?,
-            pad: read_u16(data, o + 14)?,
+            tag_crc: read_endian_u32(data, o, endian)?,
+            parent_idx: read_endian_i16(data, o + 4, endian)?,
+            child_count: read_endian_i16(data, o + 6, endian)?,
+            first_child: read_endian_i16(data, o + 8, endian)?,
+            attr_count: read_endian_i16(data, o + 10, endian)?,
+            first_attr,
+            pad,
             extra: 0,
         });
     }
@@ -375,8 +462,8 @@ fn parse_obscure2(data: &[u8]) -> Result<ParsedXmc> {
     for i in 0..attr_count {
         let o = attr_start + i * ATTR_SIZE;
         attrs.push(XmcAttribute {
-            name_crc: read_u32(data, o)?,
-            value_offset: read_u32(data, o + 4)?,
+            name_crc: read_endian_u32(data, o, endian)?,
+            value_offset: read_endian_u32(data, o + 4, endian)?,
         });
     }
 
@@ -384,7 +471,10 @@ fn parse_obscure2(data: &[u8]) -> Result<ParsedXmc> {
         nodes,
         attrs,
         pool: data[strings_start..end].to_vec(),
-        format: XmcFormat::Obscure2,
+        format: match endian {
+            Endian::Little => XmcFormat::Obscure2,
+            Endian::Big => XmcFormat::Wii,
+        },
         version: 0,
     })
 }
@@ -423,7 +513,7 @@ fn parse_final_exam(data: &[u8]) -> Result<ParsedXmc> {
             child_count: read_i16(data, o + 6)?,
             first_child: read_i16(data, o + 8)?,
             attr_count: read_i16(data, o + 10)?,
-            first_attr: read_i16(data, o + 12)?,
+            first_attr: read_i16(data, o + 12)? as i32,
             pad: read_u16(data, o + 14)?,
             extra: read_u32(data, o + 16)?,
         });
@@ -459,12 +549,15 @@ fn parse_final_exam(data: &[u8]) -> Result<ParsedXmc> {
 fn parse_xmc(data: &[u8], requested: XmcFormat) -> Result<ParsedXmc> {
     match requested {
         XmcFormat::FinalExam => parse_final_exam(data),
-        XmcFormat::Obscure2 => parse_obscure2(data),
+        XmcFormat::Obscure2 => parse_obscure2(data, Endian::Little),
+        XmcFormat::Wii => parse_obscure2(data, Endian::Big),
         XmcFormat::Auto => {
             if looks_like_final_exam(data) {
                 parse_final_exam(data)
+            } else if looks_like_wii(data) {
+                parse_obscure2(data, Endian::Big)
             } else {
-                parse_obscure2(data)
+                parse_obscure2(data, Endian::Little)
             }
         }
     }
@@ -643,9 +736,16 @@ fn xmc_to_xml(
 
     let mut xml = Vec::new();
     xml.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    if parsed.format == XmcFormat::FinalExam {
-        xml.extend_from_slice(FORMAT_MARKER.as_bytes());
-        xml.push(b'\n');
+    match parsed.format {
+        XmcFormat::FinalExam => {
+            xml.extend_from_slice(FE_FORMAT_MARKER.as_bytes());
+            xml.push(b'\n');
+        }
+        XmcFormat::Wii => {
+            xml.extend_from_slice(WII_FORMAT_MARKER.as_bytes());
+            xml.push(b'\n');
+        }
+        _ => {}
     }
     if !nodes.is_empty() {
         let root = element_from_node(0, nodes, attrs, pool, dict, encoding, 0)?;
@@ -741,7 +841,7 @@ fn build_element(
     let attr_count = element.attributes.len();
     nodes[idx].attr_count = validate_i16(attr_count, "attribute count")?;
     if attr_count > 0 {
-        nodes[idx].first_attr = validate_i16(first_attr, "first attribute index")?;
+        nodes[idx].first_attr = validate_i16(first_attr, "first attribute index")? as i32;
     }
 
     let child_elements: Vec<&Element> = element.children.iter().filter_map(|n| {
@@ -791,7 +891,7 @@ fn populate_reserved_child(
     }
     nodes[idx].attr_count = validate_i16(element.attributes.len(), "attribute count")?;
     if !element.attributes.is_empty() {
-        nodes[idx].first_attr = validate_i16(first_attr, "first attribute index")?;
+        nodes[idx].first_attr = validate_i16(first_attr, "first attribute index")? as i32;
     }
 
     let children: Vec<&Element> = element.children.iter().filter_map(|n| {
@@ -834,8 +934,10 @@ fn xml_to_xmc(
     // Obscure layout for XML files that do not carry one.
     let format = match format {
         XmcFormat::Auto => {
-            if text.contains(FORMAT_MARKER) {
+            if text.contains(FE_FORMAT_MARKER) {
                 XmcFormat::FinalExam
+            } else if text.contains(WII_FORMAT_MARKER) {
+                XmcFormat::Wii
             } else {
                 XmcFormat::Obscure2
             }
@@ -859,7 +961,8 @@ fn xml_to_xmc(
 
     let output_bytes = match format {
         XmcFormat::FinalExam => encode_final_exam(&nodes, &attrs, pool, debug)?,
-        _ => encode_obscure2(&nodes, &attrs, pool, debug)?,
+        XmcFormat::Wii => encode_obscure2(&nodes, &attrs, pool, Endian::Big, debug)?,
+        _ => encode_obscure2(&nodes, &attrs, pool, Endian::Little, debug)?,
     };
 
     if debug {
@@ -879,6 +982,7 @@ fn encode_obscure2(
     nodes: &[XmcNode],
     attrs: &[XmcAttribute],
     pool: Vec<u8>,
+    endian: Endian,
     debug: bool,
 ) -> Result<Vec<u8>> {
     let node_count = u32::try_from(nodes.len()).context("Too many nodes")?;
@@ -886,22 +990,28 @@ fn encode_obscure2(
     let pool_size = u32::try_from(pool.len()).context("String pool too large")?;
 
     let mut output_bytes = Vec::with_capacity(12 + nodes.len() * NODE_SIZE + attrs.len() * ATTR_SIZE + pool.len());
-    output_bytes.extend_from_slice(&node_count.to_le_bytes());
-    output_bytes.extend_from_slice(&attr_count.to_le_bytes());
-    output_bytes.extend_from_slice(&pool_size.to_le_bytes());
+    output_bytes.extend_from_slice(&endian.u32_bytes(node_count));
+    output_bytes.extend_from_slice(&endian.u32_bytes(attr_count));
+    output_bytes.extend_from_slice(&endian.u32_bytes(pool_size));
 
     for node in nodes {
-        output_bytes.extend_from_slice(&node.tag_crc.to_le_bytes());
-        output_bytes.extend_from_slice(&node.parent_idx.to_le_bytes());
-        output_bytes.extend_from_slice(&node.child_count.to_le_bytes());
-        output_bytes.extend_from_slice(&node.first_child.to_le_bytes());
-        output_bytes.extend_from_slice(&node.attr_count.to_le_bytes());
-        output_bytes.extend_from_slice(&node.first_attr.to_le_bytes());
-        output_bytes.extend_from_slice(&node.pad.to_le_bytes());
+        output_bytes.extend_from_slice(&endian.u32_bytes(node.tag_crc));
+        output_bytes.extend_from_slice(&endian.i16_bytes(node.parent_idx));
+        output_bytes.extend_from_slice(&endian.i16_bytes(node.child_count));
+        output_bytes.extend_from_slice(&endian.i16_bytes(node.first_child));
+        output_bytes.extend_from_slice(&endian.i16_bytes(node.attr_count));
+        match endian {
+            // The Wii build stores `first_attr` as a full 32-bit field.
+            Endian::Big => output_bytes.extend_from_slice(&endian.u32_bytes(node.first_attr as u32)),
+            Endian::Little => {
+                output_bytes.extend_from_slice(&endian.i16_bytes(node.first_attr as i16));
+                output_bytes.extend_from_slice(&endian.u16_bytes(node.pad));
+            }
+        }
     }
     for attr in attrs {
-        output_bytes.extend_from_slice(&attr.name_crc.to_le_bytes());
-        output_bytes.extend_from_slice(&attr.value_offset.to_le_bytes());
+        output_bytes.extend_from_slice(&endian.u32_bytes(attr.name_crc));
+        output_bytes.extend_from_slice(&endian.u32_bytes(attr.value_offset));
     }
     output_bytes.extend_from_slice(&pool);
 
@@ -952,7 +1062,7 @@ fn encode_final_exam(
         output_bytes.extend_from_slice(&node.child_count.to_le_bytes());
         output_bytes.extend_from_slice(&node.first_child.to_le_bytes());
         output_bytes.extend_from_slice(&node.attr_count.to_le_bytes());
-        output_bytes.extend_from_slice(&node.first_attr.to_le_bytes());
+        output_bytes.extend_from_slice(&(node.first_attr as i16).to_le_bytes());
         output_bytes.extend_from_slice(&node.pad.to_le_bytes());
         output_bytes.extend_from_slice(&node.extra.to_le_bytes());
     }
