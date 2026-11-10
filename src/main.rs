@@ -12,6 +12,28 @@ use xmltree::{Element, EmitterConfig, XMLNode};
 const NODE_SIZE: usize = 16;
 const ATTR_SIZE: usize = 8;
 
+/// Final Exam uses a different container: a 17-byte header, 20-byte nodes and
+/// an encrypted string pool.
+const FE_NODE_SIZE: usize = 20;
+const FE_HEADER_SIZE: usize = 17;
+const FE_MAGIC: u32 = 0x66;
+const FE_VERSION: u8 = 3;
+/// Seed mixed into the pool cipher state (`"BanI"` in little-endian).
+const FE_POOL_KEY: u32 = 0x4961_6E42;
+/// Marker written into the XML so `build` can pick the right container back.
+const FORMAT_MARKER: &str = "<!-- xmc-format: final-exam -->";
+
+/// Container format of an `.xmc` file.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum XmcFormat {
+    /// Detect from the file when extracting, or from the XML marker when building.
+    Auto,
+    /// Obscure 1/2 style container.
+    Obscure2,
+    /// Final Exam style container.
+    FinalExam,
+}
+
 /// CRC of the unnamed attribute that holds the glyph character of a `<char>` node.
 /// (hashes.json does not name it, so it shows up as `attr_0BB5AC54`.)
 const FONT_CHAR_VALUE_CRC: u32 = 0x0BB5_AC54;
@@ -148,8 +170,8 @@ mod text {
 #[command(
     name = "obscure-xmc-converter",
     version,
-    about = "Convert between Obscure 2 XMC and XML",
-    long_about = "Extract XMC files to XML or build XMC files from XML."
+    about = "Convert between Obscure 1/2 and Final Exam XMC and XML",
+    long_about = "Extract XMC files (Obscure 1/2 and Final Exam) to XML or build XMC files from XML."
 )]
 struct Args {
     #[command(subcommand)]
@@ -176,6 +198,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = TextEncoding::Auto)]
         encoding: TextEncoding,
 
+        /// Container format (auto detects the file layout)
+        #[arg(long, value_enum, default_value_t = XmcFormat::Auto)]
+        format: XmcFormat,
+
         /// Print additional binary information
         #[arg(long)]
         debug: bool,
@@ -198,6 +224,11 @@ enum Command {
         /// String pool encoding
         #[arg(long, value_enum, default_value_t = TextEncoding::Auto)]
         encoding: TextEncoding,
+
+        /// Container format (auto reads the marker written by extract, and
+        /// falls back to the Obscure 1/2 layout)
+        #[arg(long, value_enum, default_value_t = XmcFormat::Auto)]
+        format: XmcFormat,
 
         /// Reuse an identical string that is already in the pool. The shipped
         /// files store one copy per attribute, so this is off by default.
@@ -224,12 +255,24 @@ struct XmcNode {
     first_child: i16,
     attr_count: i16,
     first_attr: i16,
+    /// Trailing `u16` padding of the 16-byte Obscure node (unused by Final Exam).
+    pad: u16,
+    /// Final Exam only: trailing `u32`, `0xFFFFFFFF` in every shipped file.
+    extra: u32,
 }
 
 #[derive(Clone, Debug)]
 struct XmcAttribute {
     name_crc: u32,
     value_offset: u32,
+}
+
+struct ParsedXmc {
+    nodes: Vec<XmcNode>,
+    attrs: Vec<XmcAttribute>,
+    pool: Vec<u8>,
+    format: XmcFormat,
+    version: u8,
 }
 
 fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
@@ -242,7 +285,61 @@ fn read_i16(data: &[u8], offset: usize) -> Result<i16> {
     Ok(i16::from_le_bytes(bytes.try_into()?))
 }
 
-fn parse_xmc(data: &[u8]) -> Result<(Vec<XmcNode>, Vec<XmcAttribute>, Vec<u8>)> {
+fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
+    let bytes = data.get(offset..offset + 2).context("Unexpected end of file reading u16")?;
+    Ok(u16::from_le_bytes(bytes.try_into()?))
+}
+
+/// Final Exam string pool cipher. `decrypt` reverses the in-place transform the
+/// game applies right after reading the pool; the same keystream is used for
+/// both directions, and it only depends on the three header counts.
+fn fe_crypt_pool(
+    bytes: &mut [u8],
+    node_count: u32,
+    attr_count: u32,
+    pool_size: u32,
+    decrypt: bool,
+) {
+    let mut state = node_count.wrapping_add(attr_count).wrapping_add(pool_size);
+    let mut mix = state ^ FE_POOL_KEY;
+    for byte in bytes.iter_mut() {
+        state = state
+            .wrapping_mul(0x1_0000)
+            .wrapping_add(state >> 16)
+            .wrapping_add(mix);
+        let key = (state & 0xFF) as u8;
+        *byte = if decrypt { byte.wrapping_sub(key) } else { byte.wrapping_add(key) };
+        mix = mix.wrapping_add(state);
+    }
+}
+
+/// The Final Exam header stores its three counts as little-endian `u24` values,
+/// so the high byte of each `u32` read is always zero.
+fn fe_counts(data: &[u8]) -> Result<(usize, usize, usize)> {
+    let node_count = (read_u32(data, 4)? >> 8) as usize;
+    let attr_count = (read_u32(data, 8)? >> 8) as usize;
+    let pool_size = (read_u32(data, 12)? >> 8) as usize;
+    Ok((node_count, attr_count, pool_size))
+}
+
+fn looks_like_final_exam(data: &[u8]) -> bool {
+    if data.len() < FE_HEADER_SIZE || read_u32(data, 0).ok() != Some(FE_MAGIC) {
+        return false;
+    }
+    let Ok((node_count, attr_count, pool_size)) = fe_counts(data) else {
+        return false;
+    };
+    let Some(end) = FE_HEADER_SIZE
+        .checked_add(node_count.saturating_mul(FE_NODE_SIZE))
+        .and_then(|v| v.checked_add(attr_count.saturating_mul(ATTR_SIZE)))
+        .and_then(|v| v.checked_add(pool_size))
+    else {
+        return false;
+    };
+    end == data.len()
+}
+
+fn parse_obscure2(data: &[u8]) -> Result<ParsedXmc> {
     if data.len() < 12 {
         bail!("File is too small to contain an XMC header");
     }
@@ -269,6 +366,8 @@ fn parse_xmc(data: &[u8]) -> Result<(Vec<XmcNode>, Vec<XmcAttribute>, Vec<u8>)> 
             first_child: read_i16(data, o + 8)?,
             attr_count: read_i16(data, o + 10)?,
             first_attr: read_i16(data, o + 12)?,
+            pad: read_u16(data, o + 14)?,
+            extra: 0,
         });
     }
 
@@ -280,7 +379,95 @@ fn parse_xmc(data: &[u8]) -> Result<(Vec<XmcNode>, Vec<XmcAttribute>, Vec<u8>)> 
             value_offset: read_u32(data, o + 4)?,
         });
     }
-    Ok((nodes, attrs, data[strings_start..end].to_vec()))
+
+    Ok(ParsedXmc {
+        nodes,
+        attrs,
+        pool: data[strings_start..end].to_vec(),
+        format: XmcFormat::Obscure2,
+        version: 0,
+    })
+}
+
+fn parse_final_exam(data: &[u8]) -> Result<ParsedXmc> {
+    if data.len() < FE_HEADER_SIZE {
+        bail!("File is too small to contain a Final Exam XMC header");
+    }
+    if read_u32(data, 0)? != FE_MAGIC {
+        bail!("Not a Final Exam XMC file (magic {:#x})", read_u32(data, 0)?);
+    }
+    let version = *data.get(4).context("Unexpected end of file reading version")?;
+    let (node_count, attr_count, pool_size) = fe_counts(data)?;
+
+    let node_start = FE_HEADER_SIZE;
+    let attr_start = node_start
+        .checked_add(node_count.checked_mul(FE_NODE_SIZE).context("Node count overflow")?)
+        .context("File offset overflow")?;
+    let pool_start = attr_start
+        .checked_add(attr_count.checked_mul(ATTR_SIZE).context("Attribute count overflow")?)
+        .context("File offset overflow")?;
+    let end = pool_start.checked_add(pool_size).context("File size overflow")?;
+    if end > data.len() {
+        bail!(
+            "Final Exam XMC header counts exceed file size (expected at least {end} bytes, got {})",
+            data.len()
+        );
+    }
+
+    let mut nodes = Vec::with_capacity(node_count);
+    for i in 0..node_count {
+        let o = node_start + i * FE_NODE_SIZE;
+        nodes.push(XmcNode {
+            tag_crc: read_u32(data, o)?,
+            parent_idx: read_i16(data, o + 4)?,
+            child_count: read_i16(data, o + 6)?,
+            first_child: read_i16(data, o + 8)?,
+            attr_count: read_i16(data, o + 10)?,
+            first_attr: read_i16(data, o + 12)?,
+            pad: read_u16(data, o + 14)?,
+            extra: read_u32(data, o + 16)?,
+        });
+    }
+
+    let mut attrs = Vec::with_capacity(attr_count);
+    for i in 0..attr_count {
+        let o = attr_start + i * ATTR_SIZE;
+        attrs.push(XmcAttribute {
+            name_crc: read_u32(data, o)?,
+            value_offset: read_u32(data, o + 4)?,
+        });
+    }
+
+    let mut pool = data[pool_start..end].to_vec();
+    fe_crypt_pool(
+        &mut pool,
+        node_count as u32,
+        attr_count as u32,
+        pool_size as u32,
+        true,
+    );
+
+    Ok(ParsedXmc {
+        nodes,
+        attrs,
+        pool,
+        format: XmcFormat::FinalExam,
+        version,
+    })
+}
+
+fn parse_xmc(data: &[u8], requested: XmcFormat) -> Result<ParsedXmc> {
+    match requested {
+        XmcFormat::FinalExam => parse_final_exam(data),
+        XmcFormat::Obscure2 => parse_obscure2(data),
+        XmcFormat::Auto => {
+            if looks_like_final_exam(data) {
+                parse_final_exam(data)
+            } else {
+                parse_obscure2(data)
+            }
+        }
+    }
 }
 
 fn crc32(text: &str) -> u32 {
@@ -302,7 +489,12 @@ fn load_crc_dictionary(path: &Path) -> Result<HashMap<u32, String>> {
                     None => continue,
                 };
                 let crc = parse_crc_key(&key).unwrap_or_else(|| crc32(&key));
-                map.insert(crc, name);
+                // CRC 0 is crc32("") and has no valid XML name; the shipped
+                // dictionary maps it to "data", which collides with the real
+                // "data" attribute. Skip it so CRC 0 keeps its placeholder.
+                if crc != 0 {
+                    map.insert(crc, name);
+                }
             }
         }
         Ok(Value::Array(items)) => {
@@ -429,12 +621,21 @@ fn xmc_to_xml(
     output: &Path,
     dict: &HashMap<u32, String>,
     encoding: TextEncoding,
+    format: XmcFormat,
     debug: bool,
 ) -> Result<()> {
     let data = fs::read(input).with_context(|| format!("Could not read {}", input.display()))?;
-    let (nodes, attrs, pool) = parse_xmc(&data)?;
+    let parsed = parse_xmc(&data, format)?;
+    let (nodes, attrs, pool) = (&parsed.nodes, &parsed.attrs, &parsed.pool);
     if debug {
-        println!("Header: nodes={}, attrs={}, strings={} bytes", nodes.len(), attrs.len(), pool.len());
+        println!(
+            "Format: {:?}, header: nodes={}, attrs={}, strings={} bytes, version={}",
+            parsed.format,
+            nodes.len(),
+            attrs.len(),
+            pool.len(),
+            parsed.version
+        );
         for (i, node) in nodes.iter().take(10).enumerate() {
             println!("node[{i}]: {node:?}");
         }
@@ -442,8 +643,12 @@ fn xmc_to_xml(
 
     let mut xml = Vec::new();
     xml.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    if parsed.format == XmcFormat::FinalExam {
+        xml.extend_from_slice(FORMAT_MARKER.as_bytes());
+        xml.push(b'\n');
+    }
     if !nodes.is_empty() {
-        let root = element_from_node(0, &nodes, &attrs, &pool, dict, encoding, 0)?;
+        let root = element_from_node(0, nodes, attrs, pool, dict, encoding, 0)?;
         root.write_with_config(
             &mut xml,
             EmitterConfig::new().perform_indent(true).write_document_declaration(false),
@@ -509,6 +714,8 @@ fn new_node(tag_crc: u32, parent: i16) -> XmcNode {
         first_child: 0,
         attr_count: 0,
         first_attr: 0,
+        pad: 0,
+        extra: 0xFFFF_FFFF,
     }
 }
 
@@ -614,11 +821,27 @@ fn xml_to_xmc(
     output: &Path,
     dict: &HashMap<u32, String>,
     encoding: TextEncoding,
+    format: XmcFormat,
     dedup: bool,
     debug: bool,
 ) -> Result<()> {
-    let file = fs::File::open(input).with_context(|| format!("Could not open {}", input.display()))?;
-    let root = Element::parse(file).with_context(|| format!("Could not parse XML {}", input.display()))?;
+    let text = fs::read_to_string(input)
+        .with_context(|| format!("Could not read {}", input.display()))?;
+    let root = Element::parse(text.as_bytes())
+        .with_context(|| format!("Could not parse XML {}", input.display()))?;
+
+    // `auto` follows the marker written by `extract`, and keeps the historical
+    // Obscure layout for XML files that do not carry one.
+    let format = match format {
+        XmcFormat::Auto => {
+            if text.contains(FORMAT_MARKER) {
+                XmcFormat::FinalExam
+            } else {
+                XmcFormat::Obscure2
+            }
+        }
+        explicit => explicit,
+    };
 
     let mut reverse = HashMap::new();
     for (crc, name) in dict {
@@ -634,6 +857,30 @@ fn xml_to_xmc(
         &root, 0, &mut nodes, &mut attrs, &mut pool, &mut string_offsets, &reverse, encoding, dedup,
     )?;
 
+    let output_bytes = match format {
+        XmcFormat::FinalExam => encode_final_exam(&nodes, &attrs, pool, debug)?,
+        _ => encode_obscure2(&nodes, &attrs, pool, debug)?,
+    };
+
+    if debug {
+        println!(
+            "Format: {:?}, nodes={}, attrs={}",
+            format,
+            nodes.len(),
+            attrs.len()
+        );
+    }
+    fs::write(output, &output_bytes).with_context(|| format!("Could not write {}", output.display()))?;
+    println!("Converted XML -> XMC: {} ({} bytes)", output.display(), output_bytes.len());
+    Ok(())
+}
+
+fn encode_obscure2(
+    nodes: &[XmcNode],
+    attrs: &[XmcAttribute],
+    pool: Vec<u8>,
+    debug: bool,
+) -> Result<Vec<u8>> {
     let node_count = u32::try_from(nodes.len()).context("Too many nodes")?;
     let attr_count = u32::try_from(attrs.len()).context("Too many attributes")?;
     let pool_size = u32::try_from(pool.len()).context("String pool too large")?;
@@ -643,16 +890,16 @@ fn xml_to_xmc(
     output_bytes.extend_from_slice(&attr_count.to_le_bytes());
     output_bytes.extend_from_slice(&pool_size.to_le_bytes());
 
-    for node in &nodes {
+    for node in nodes {
         output_bytes.extend_from_slice(&node.tag_crc.to_le_bytes());
         output_bytes.extend_from_slice(&node.parent_idx.to_le_bytes());
         output_bytes.extend_from_slice(&node.child_count.to_le_bytes());
         output_bytes.extend_from_slice(&node.first_child.to_le_bytes());
         output_bytes.extend_from_slice(&node.attr_count.to_le_bytes());
         output_bytes.extend_from_slice(&node.first_attr.to_le_bytes());
-        output_bytes.extend_from_slice(&0u16.to_le_bytes());
+        output_bytes.extend_from_slice(&node.pad.to_le_bytes());
     }
-    for attr in &attrs {
+    for attr in attrs {
         output_bytes.extend_from_slice(&attr.name_crc.to_le_bytes());
         output_bytes.extend_from_slice(&attr.value_offset.to_le_bytes());
     }
@@ -661,9 +908,69 @@ fn xml_to_xmc(
     if debug {
         println!("Debug: nodes={}, attrs={}, string_pool={} bytes", nodes.len(), attrs.len(), pool.len());
     }
-    fs::write(output, &output_bytes).with_context(|| format!("Could not write {}", output.display()))?;
-    println!("Converted XML -> XMC: {} ({} bytes)", output.display(), output_bytes.len());
-    Ok(())
+    Ok(output_bytes)
+}
+
+fn encode_final_exam(
+    nodes: &[XmcNode],
+    attrs: &[XmcAttribute],
+    mut pool: Vec<u8>,
+    debug: bool,
+) -> Result<Vec<u8>> {
+    // The shipped pools are zero-padded to a 16-byte boundary, and the padding
+    // is part of the encrypted region.
+    let padded = (pool.len() + 15) / 16 * 16;
+    pool.resize(padded, 0);
+
+    let node_count = u32::try_from(nodes.len()).context("Too many nodes")?;
+    let attr_count = u32::try_from(attrs.len()).context("Too many attributes")?;
+    let pool_size = u32::try_from(pool.len()).context("String pool too large")?;
+    for (value, field) in [
+        (node_count, "node count"),
+        (attr_count, "attribute count"),
+        (pool_size, "string pool size"),
+    ] {
+        if value >= 1 << 24 {
+            bail!("{field} does not fit the 24-bit Final Exam header field: {value}");
+        }
+    }
+
+    fe_crypt_pool(&mut pool, node_count, attr_count, pool_size, false);
+
+    let mut output_bytes = Vec::with_capacity(
+        FE_HEADER_SIZE + nodes.len() * FE_NODE_SIZE + attrs.len() * ATTR_SIZE + pool.len(),
+    );
+    output_bytes.extend_from_slice(&FE_MAGIC.to_le_bytes());
+    output_bytes.push(FE_VERSION);
+    output_bytes.extend_from_slice(&node_count.to_le_bytes());
+    output_bytes.extend_from_slice(&attr_count.to_le_bytes());
+    output_bytes.extend_from_slice(&pool_size.to_le_bytes());
+
+    for node in nodes {
+        output_bytes.extend_from_slice(&node.tag_crc.to_le_bytes());
+        output_bytes.extend_from_slice(&node.parent_idx.to_le_bytes());
+        output_bytes.extend_from_slice(&node.child_count.to_le_bytes());
+        output_bytes.extend_from_slice(&node.first_child.to_le_bytes());
+        output_bytes.extend_from_slice(&node.attr_count.to_le_bytes());
+        output_bytes.extend_from_slice(&node.first_attr.to_le_bytes());
+        output_bytes.extend_from_slice(&node.pad.to_le_bytes());
+        output_bytes.extend_from_slice(&node.extra.to_le_bytes());
+    }
+    for attr in attrs {
+        output_bytes.extend_from_slice(&attr.name_crc.to_le_bytes());
+        output_bytes.extend_from_slice(&attr.value_offset.to_le_bytes());
+    }
+    output_bytes.extend_from_slice(&pool);
+
+    if debug {
+        println!(
+            "Debug: nodes={}, attrs={}, string_pool={} bytes (padded)",
+            nodes.len(),
+            attrs.len(),
+            pool_size
+        );
+    }
+    Ok(output_bytes)
 }
 
 fn resolve_default_dict() -> Option<PathBuf> {
@@ -721,7 +1028,7 @@ fn parse_args_with_implicit_mode() -> Args {
             continue;
         }
 
-        if matches!(value, "--dict" | "-o" | "--output") {
+        if matches!(value, "--dict" | "-o" | "--output" | "--format" | "--encoding") {
             skip_next = true;
             continue;
         }
@@ -729,6 +1036,8 @@ fn parse_args_with_implicit_mode() -> Args {
         // Also support --dict=... and --output=...
         if value.starts_with("--dict=")
             || value.starts_with("--output=")
+            || value.starts_with("--format=")
+            || value.starts_with("--encoding=")
             || value.starts_with("-o=")
         {
             continue;
@@ -778,23 +1087,25 @@ fn parse_args_with_implicit_mode() -> Args {
 fn main() -> Result<()> {
     let args = parse_args_with_implicit_mode();
 
-    let (inputs, output, dict_file, encoding, dedup, debug, mode) = match args.command {
+    let (inputs, output, dict_file, encoding, format, dedup, debug, mode) = match args.command {
         Command::Extract {
             inputs,
             output,
             dict_file,
             encoding,
+            format,
             debug,
-        } => (inputs, output, dict_file, encoding, false, debug, Mode::Xmc2xml),
+        } => (inputs, output, dict_file, encoding, format, false, debug, Mode::Xmc2xml),
 
         Command::Build {
             inputs,
             output,
             dict_file,
             encoding,
+            format,
             dedup,
             debug,
-        } => (inputs, output, dict_file, encoding, dedup, debug, Mode::Xml2xmc),
+        } => (inputs, output, dict_file, encoding, format, dedup, debug, Mode::Xml2xmc),
     };
 
     let dict_path = dict_file.or_else(resolve_default_dict);
@@ -867,10 +1178,10 @@ fn main() -> Result<()> {
 
         match mode {
             Mode::Xmc2xml => {
-                xmc_to_xml(source, &destination, &dict, encoding, debug)?;
+                xmc_to_xml(source, &destination, &dict, encoding, format, debug)?;
             }
             Mode::Xml2xmc => {
-                xml_to_xmc(source, &destination, &dict, encoding, dedup, debug)?;
+                xml_to_xmc(source, &destination, &dict, encoding, format, dedup, debug)?;
             }
         }
     }
