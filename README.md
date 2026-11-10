@@ -3,6 +3,13 @@ A CLI tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 2 a
 Final Exam (all of which share the same XML vocabulary, in two different binary
 containers).
 
+## Supported Versions
+
+| Game                     | PC | 
+|--------------------------|:------:|
+| Obscure 2                |   ✅   | 
+| Final Exam                |   ✅   |
+
 # How to Compile
 ## Windows
 Install Rust, and in that folder, run:
