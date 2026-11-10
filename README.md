@@ -1,5 +1,5 @@
 # Obscure XMC Converter
-A CLI tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 1/2 and
+A CLI tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 2 and
 Final Exam (all of which share the same XML vocabulary, in two different binary
 containers).
 
@@ -96,7 +96,7 @@ and Final Exam files.
 
 There are two layouts, both detected automatically:
 
-| | Obscure 1 / 2 | Final Exam |
+| | Obscure 2 | Final Exam |
 |---|---|---|
 | Header | 12 bytes (`u32` node/attr/string counts) | 17 bytes (`u32` magic `0x66`, `u8` version `3`, three 24-bit counts) |
 | Node | 16 bytes | 20 bytes (adds `u16` padding + `u32` `0xFFFFFFFF`) |
