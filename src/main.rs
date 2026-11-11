@@ -22,6 +22,7 @@ const FE_VERSION: u8 = 3;
 const FE_POOL_KEY: u32 = 0x4961_6E42;
 /// Markers written into the XML so `build` can pick the right container back.
 const FE_FORMAT_MARKER: &str = "<!-- xmc-format: final-exam -->";
+const XBOX360_FORMAT_MARKER: &str = "<!-- xmc-format: xbox360 -->";
 const WII_FORMAT_MARKER: &str = "<!-- xmc-format: wii -->";
 
 /// Container format of an `.xmc` file.
@@ -38,6 +39,10 @@ enum XmcFormat {
     Wii,
     /// Final Exam style container.
     FinalExam,
+    /// Final Exam on Xbox 360: same container as Final Exam, but big-endian and
+    /// with a 32-bit `first_attr` instead of the trailing 16-bit padding.
+    #[value(name = "xbox360", alias = "x360", alias = "xbox")]
+    Xbox360,
 }
 
 /// CRC of the unnamed attribute that holds the glyph character of a `<char>` node.
@@ -325,16 +330,6 @@ struct ParsedXmc {
     version: u8,
 }
 
-fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
-    let bytes = data.get(offset..offset + 4).context("Unexpected end of file reading u32")?;
-    Ok(u32::from_le_bytes(bytes.try_into()?))
-}
-
-fn read_i16(data: &[u8], offset: usize) -> Result<i16> {
-    let bytes = data.get(offset..offset + 2).context("Unexpected end of file reading i16")?;
-    Ok(i16::from_le_bytes(bytes.try_into()?))
-}
-
 fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
     let bytes = data.get(offset..offset + 2).context("Unexpected end of file reading u16")?;
     Ok(u16::from_le_bytes(bytes.try_into()?))
@@ -373,30 +368,40 @@ fn fe_crypt_pool(
     }
 }
 
-/// The Final Exam header stores its three counts as little-endian `u24` values,
-/// so the high byte of each `u32` read is always zero.
-fn fe_counts(data: &[u8]) -> Result<(usize, usize, usize)> {
-    let node_count = (read_u32(data, 4)? >> 8) as usize;
-    let attr_count = (read_u32(data, 8)? >> 8) as usize;
-    let pool_size = (read_u32(data, 12)? >> 8) as usize;
+/// The Final Exam header is 17 bytes: a `u32` magic, a `u8` version and three
+/// 32-bit counts, one after the other. The PC build writes them little-endian
+/// and the Xbox 360 build big-endian.
+fn fe_counts(data: &[u8], endian: Endian) -> Result<(usize, usize, usize)> {
+    let node_count = read_endian_u32(data, 5, endian)? as usize;
+    let attr_count = read_endian_u32(data, 9, endian)? as usize;
+    let pool_size = read_endian_u32(data, 13, endian)? as usize;
     Ok((node_count, attr_count, pool_size))
 }
 
-fn looks_like_final_exam(data: &[u8]) -> bool {
-    if data.len() < FE_HEADER_SIZE || read_u32(data, 0).ok() != Some(FE_MAGIC) {
-        return false;
+/// Byte length the Final Exam header counts describe, if they can be trusted.
+fn fe_declared_len(data: &[u8], endian: Endian) -> Option<usize> {
+    if data.len() < FE_HEADER_SIZE || read_endian_u32(data, 0, endian).ok()? != FE_MAGIC {
+        return None;
     }
-    let Ok((node_count, attr_count, pool_size)) = fe_counts(data) else {
-        return false;
-    };
-    let Some(end) = FE_HEADER_SIZE
-        .checked_add(node_count.saturating_mul(FE_NODE_SIZE))
-        .and_then(|v| v.checked_add(attr_count.saturating_mul(ATTR_SIZE)))
-        .and_then(|v| v.checked_add(pool_size))
-    else {
-        return false;
-    };
-    end == data.len()
+    let (node_count, attr_count, pool_size) = fe_counts(data, endian).ok()?;
+    let end = FE_HEADER_SIZE
+        .checked_add(node_count.checked_mul(FE_NODE_SIZE)?)?
+        .checked_add(attr_count.checked_mul(ATTR_SIZE)?)?
+        .checked_add(pool_size)?;
+    if end > data.len() {
+        return None;
+    }
+    Some(end)
+}
+
+fn looks_like_final_exam(data: &[u8]) -> bool {
+    fe_declared_len(data, Endian::Little) == Some(data.len())
+}
+
+/// The Xbox 360 build of Final Exam stores the same container big-endian.
+fn looks_like_xbox360(data: &[u8]) -> bool {
+    fe_declared_len(data, Endian::Big) == Some(data.len())
+        && fe_declared_len(data, Endian::Little) != Some(data.len())
 }
 
 /// Byte length the Obscure header counts describe, if they can be trusted.
@@ -481,15 +486,16 @@ fn parse_obscure2(data: &[u8], endian: Endian) -> Result<ParsedXmc> {
     })
 }
 
-fn parse_final_exam(data: &[u8]) -> Result<ParsedXmc> {
+fn parse_final_exam(data: &[u8], endian: Endian) -> Result<ParsedXmc> {
     if data.len() < FE_HEADER_SIZE {
         bail!("File is too small to contain a Final Exam XMC header");
     }
-    if read_u32(data, 0)? != FE_MAGIC {
-        bail!("Not a Final Exam XMC file (magic {:#x})", read_u32(data, 0)?);
+    let magic = read_endian_u32(data, 0, endian)?;
+    if magic != FE_MAGIC {
+        bail!("Not a Final Exam XMC file (magic {magic:#x})");
     }
     let version = *data.get(4).context("Unexpected end of file reading version")?;
-    let (node_count, attr_count, pool_size) = fe_counts(data)?;
+    let (node_count, attr_count, pool_size) = fe_counts(data, endian)?;
 
     let node_start = FE_HEADER_SIZE;
     let attr_start = node_start
@@ -509,15 +515,21 @@ fn parse_final_exam(data: &[u8]) -> Result<ParsedXmc> {
     let mut nodes = Vec::with_capacity(node_count);
     for i in 0..node_count {
         let o = node_start + i * FE_NODE_SIZE;
+        let (first_attr, pad) = match endian {
+            // The Xbox 360 build widens `first_attr` to 32 bits and drops the
+            // padding, just like the Wii build of Obscure 2.
+            Endian::Big => (read_endian_u32(data, o + 12, endian)? as i32, 0),
+            Endian::Little => (read_endian_i16(data, o + 12, endian)? as i32, read_u16(data, o + 14)?),
+        };
         nodes.push(XmcNode {
-            tag_crc: read_u32(data, o)?,
-            parent_idx: read_i16(data, o + 4)?,
-            child_count: read_i16(data, o + 6)?,
-            first_child: read_i16(data, o + 8)?,
-            attr_count: read_i16(data, o + 10)?,
-            first_attr: read_i16(data, o + 12)? as i32,
-            pad: read_u16(data, o + 14)?,
-            extra: read_u32(data, o + 16)?,
+            tag_crc: read_endian_u32(data, o, endian)?,
+            parent_idx: read_endian_i16(data, o + 4, endian)?,
+            child_count: read_endian_i16(data, o + 6, endian)?,
+            first_child: read_endian_i16(data, o + 8, endian)?,
+            attr_count: read_endian_i16(data, o + 10, endian)?,
+            first_attr,
+            pad,
+            extra: read_endian_u32(data, o + 16, endian)?,
         });
     }
 
@@ -525,8 +537,8 @@ fn parse_final_exam(data: &[u8]) -> Result<ParsedXmc> {
     for i in 0..attr_count {
         let o = attr_start + i * ATTR_SIZE;
         attrs.push(XmcAttribute {
-            name_crc: read_u32(data, o)?,
-            value_offset: read_u32(data, o + 4)?,
+            name_crc: read_endian_u32(data, o, endian)?,
+            value_offset: read_endian_u32(data, o + 4, endian)?,
         });
     }
 
@@ -543,19 +555,25 @@ fn parse_final_exam(data: &[u8]) -> Result<ParsedXmc> {
         nodes,
         attrs,
         pool,
-        format: XmcFormat::FinalExam,
+        format: match endian {
+            Endian::Little => XmcFormat::FinalExam,
+            Endian::Big => XmcFormat::Xbox360,
+        },
         version,
     })
 }
 
 fn parse_xmc(data: &[u8], requested: XmcFormat) -> Result<ParsedXmc> {
     match requested {
-        XmcFormat::FinalExam => parse_final_exam(data),
+        XmcFormat::FinalExam => parse_final_exam(data, Endian::Little),
+        XmcFormat::Xbox360 => parse_final_exam(data, Endian::Big),
         XmcFormat::Obscure2 => parse_obscure2(data, Endian::Little),
         XmcFormat::Wii => parse_obscure2(data, Endian::Big),
         XmcFormat::Auto => {
             if looks_like_final_exam(data) {
-                parse_final_exam(data)
+                parse_final_exam(data, Endian::Little)
+            } else if looks_like_xbox360(data) {
+                parse_final_exam(data, Endian::Big)
             } else if looks_like_wii(data) {
                 parse_obscure2(data, Endian::Big)
             } else {
@@ -741,6 +759,10 @@ fn xmc_to_xml(
     match parsed.format {
         XmcFormat::FinalExam => {
             xml.extend_from_slice(FE_FORMAT_MARKER.as_bytes());
+            xml.push(b'\n');
+        }
+        XmcFormat::Xbox360 => {
+            xml.extend_from_slice(XBOX360_FORMAT_MARKER.as_bytes());
             xml.push(b'\n');
         }
         XmcFormat::Wii => {
@@ -938,6 +960,8 @@ fn xml_to_xmc(
         XmcFormat::Auto => {
             if text.contains(FE_FORMAT_MARKER) {
                 XmcFormat::FinalExam
+            } else if text.contains(XBOX360_FORMAT_MARKER) {
+                XmcFormat::Xbox360
             } else if text.contains(WII_FORMAT_MARKER) {
                 XmcFormat::Wii
             } else {
@@ -962,7 +986,8 @@ fn xml_to_xmc(
     )?;
 
     let output_bytes = match format {
-        XmcFormat::FinalExam => encode_final_exam(&nodes, &attrs, pool, debug)?,
+        XmcFormat::FinalExam => encode_final_exam(&nodes, &attrs, pool, Endian::Little, debug)?,
+        XmcFormat::Xbox360 => encode_final_exam(&nodes, &attrs, pool, Endian::Big, debug)?,
         XmcFormat::Wii => encode_obscure2(&nodes, &attrs, pool, Endian::Big, debug)?,
         _ => encode_obscure2(&nodes, &attrs, pool, Endian::Little, debug)?,
     };
@@ -1034,6 +1059,7 @@ fn encode_final_exam(
     nodes: &[XmcNode],
     attrs: &[XmcAttribute],
     mut pool: Vec<u8>,
+    endian: Endian,
     debug: bool,
 ) -> Result<Vec<u8>> {
     // The shipped pools are zero-padded to a 16-byte boundary, and the padding
@@ -1044,13 +1070,17 @@ fn encode_final_exam(
     let node_count = u32::try_from(nodes.len()).context("Too many nodes")?;
     let attr_count = u32::try_from(attrs.len()).context("Too many attributes")?;
     let pool_size = u32::try_from(pool.len()).context("String pool too large")?;
-    for (value, field) in [
-        (node_count, "node count"),
-        (attr_count, "attribute count"),
-        (pool_size, "string pool size"),
-    ] {
-        if value >= 1 << 24 {
-            bail!("{field} does not fit the 24-bit Final Exam header field: {value}");
+    // The PC build's game code reads the counts as 24-bit values. The Xbox 360
+    // build stores full 32-bit counts, so only the PC build needs the limit.
+    if endian == Endian::Little {
+        for (value, field) in [
+            (node_count, "node count"),
+            (attr_count, "attribute count"),
+            (pool_size, "string pool size"),
+        ] {
+            if value >= 1 << 24 {
+                bail!("{field} does not fit the 24-bit Final Exam header field: {value}");
+            }
         }
     }
 
@@ -1059,25 +1089,31 @@ fn encode_final_exam(
     let mut output_bytes = Vec::with_capacity(
         FE_HEADER_SIZE + nodes.len() * FE_NODE_SIZE + attrs.len() * ATTR_SIZE + pool.len(),
     );
-    output_bytes.extend_from_slice(&FE_MAGIC.to_le_bytes());
+    output_bytes.extend_from_slice(&endian.u32_bytes(FE_MAGIC));
     output_bytes.push(FE_VERSION);
-    output_bytes.extend_from_slice(&node_count.to_le_bytes());
-    output_bytes.extend_from_slice(&attr_count.to_le_bytes());
-    output_bytes.extend_from_slice(&pool_size.to_le_bytes());
+    output_bytes.extend_from_slice(&endian.u32_bytes(node_count));
+    output_bytes.extend_from_slice(&endian.u32_bytes(attr_count));
+    output_bytes.extend_from_slice(&endian.u32_bytes(pool_size));
 
     for node in nodes {
-        output_bytes.extend_from_slice(&node.tag_crc.to_le_bytes());
-        output_bytes.extend_from_slice(&node.parent_idx.to_le_bytes());
-        output_bytes.extend_from_slice(&node.child_count.to_le_bytes());
-        output_bytes.extend_from_slice(&node.first_child.to_le_bytes());
-        output_bytes.extend_from_slice(&node.attr_count.to_le_bytes());
-        output_bytes.extend_from_slice(&(node.first_attr as i16).to_le_bytes());
-        output_bytes.extend_from_slice(&node.pad.to_le_bytes());
-        output_bytes.extend_from_slice(&node.extra.to_le_bytes());
+        output_bytes.extend_from_slice(&endian.u32_bytes(node.tag_crc));
+        output_bytes.extend_from_slice(&endian.i16_bytes(node.parent_idx));
+        output_bytes.extend_from_slice(&endian.i16_bytes(node.child_count));
+        output_bytes.extend_from_slice(&endian.i16_bytes(node.first_child));
+        output_bytes.extend_from_slice(&endian.i16_bytes(node.attr_count));
+        match endian {
+            // The Xbox 360 build stores `first_attr` as a full 32-bit field.
+            Endian::Big => output_bytes.extend_from_slice(&endian.u32_bytes(node.first_attr as u32)),
+            Endian::Little => {
+                output_bytes.extend_from_slice(&endian.i16_bytes(node.first_attr as i16));
+                output_bytes.extend_from_slice(&endian.u16_bytes(node.pad));
+            }
+        }
+        output_bytes.extend_from_slice(&endian.u32_bytes(node.extra));
     }
     for attr in attrs {
-        output_bytes.extend_from_slice(&attr.name_crc.to_le_bytes());
-        output_bytes.extend_from_slice(&attr.value_offset.to_le_bytes());
+        output_bytes.extend_from_slice(&endian.u32_bytes(attr.name_crc));
+        output_bytes.extend_from_slice(&endian.u32_bytes(attr.value_offset));
     }
     output_bytes.extend_from_slice(&pool);
 

@@ -1,14 +1,14 @@
 # Obscure XMC Converter
 A CLI tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 1/2
-(PC, PS2, Wii and PSP) and Final Exam, which share the same XML vocabulary in
-three different binary containers.
+(PC, PS2, Wii and PSP) and Final Exam (PC and Xbox 360), which share the same
+XML vocabulary in four different binary containers.
 
 ## Supported Versions
 
-| Game                     | PC     | PS2    | Wii     | PSP    |
-|--------------------------|:------:|:------:|:-------:|:------:|
-| Obscure 2                |   ✅   |   ✅   |   ✅   |   ✅  |
-| Final Exam               |   ✅   |        |         |        |
+| Game                     | PC     | PS2    | Wii     | PSP    | Xbox 360 |
+|--------------------------|:------:|:------:|:-------:|:------:|:--------:|
+| Obscure 2                |   ✅   |   ✅   |   ✅   |   ✅  |          |
+| Final Exam               |   ✅   |        |         |        |    ✅    |
 
 # How to Compile
 ## Windows
@@ -102,14 +102,14 @@ and Final Exam files.
 
 ## Container formats
 
-There are three layouts, all detected automatically:
+There are four layouts, all detected automatically:
 
-| | Obscure 1/2 (PC/PS2/PSP) | Obscure 2 (Wii) | Final Exam |
-|---|---|---|---|
-| Byte order | little-endian | **big-endian** | little-endian |
-| Header | 12 bytes (`u32` node/attr/string counts) | same | 17 bytes (`u32` magic `0x66`, `u8` version `3`, three 24-bit counts) |
-| Node | 16 bytes: `first_attr` is `u16`, then `u16` padding | 16 bytes: `first_attr` is a full `u32` | 20 bytes: adds `u16` padding and `u32` `0xFFFFFFFF` |
-| String pool | plain CP1252 | plain CP1252 | encrypted with a keystream derived from the three counts |
+| | Obscure 1/2 (PC/PS2/PSP) | Obscure 2 (Wii) | Final Exam (PC) | Final Exam (Xbox 360) |
+|---|---|---|---|---|
+| Byte order | little-endian | **big-endian** | little-endian | **big-endian** |
+| Header | 12 bytes (`u32` node/attr/string counts) | same | 17 bytes (`u32` magic `0x66`, `u8` version `3`, three 24-bit counts) | 17 bytes, same fields with full 32-bit counts |
+| Node | 16 bytes: `first_attr` is `u16`, then `u16` padding | 16 bytes: `first_attr` is a full `u32` | 20 bytes: adds `u16` padding and `u32` `0xFFFFFFFF` | 20 bytes: `first_attr` is a full `u32`, then `u32` `0xFFFFFFFF` |
+| String pool | plain CP1252 | plain CP1252 | encrypted with a keystream derived from the three counts | same cipher as PC |
 
 The PS2 and PSP releases of Obscure 2 use the same container as the PC release:
 little-endian, 12-byte header, 16-byte nodes with a `u16` `first_attr` and `u16`
@@ -117,15 +117,16 @@ padding (always `0`), and a plain string pool. All 34 shipped PS2 files and all
 37 shipped PSP files match this layout, so they need no separate format flag —
 `auto` and `obscure2` both handle them.
 
-`extract` sniffs the file: Final Exam is recognised by its magic and exact size,
-and a Wii file is a big-endian Obscure header whose counts add up to the file
-size. `build` reads the `<!-- xmc-format: ... -->` comment that `extract` writes
-(`wii` or `final-exam`) and falls back to the Obscure 1/2 layout for XML that
-has no such marker.
+`extract` sniffs the file: Final Exam is recognised by its magic and exact size
+(either byte order), and a Wii file is a big-endian Obscure header whose counts
+add up to the file size. `build` reads the `<!-- xmc-format: ... -->` comment
+that `extract` writes (`wii`, `final-exam` or `xbox360`) and falls back to the
+Obscure 1/2 layout for XML that has no such marker.
 
-`--format auto` is the default; `--format obscure2` (PC/PS2/PSP), `--format wii`
-and `--format final-exam` force one layout (useful for XML files written by
-hand). `pc`, `ps2` and `psp` are accepted as aliases for `obscure2`.
+`--format auto` is the default; `--format obscure2` (PC/PS2/PSP), `--format wii`,
+`--format final-exam` and `--format xbox360` force one layout (useful for XML
+files written by hand). `pc`, `ps2` and `psp` are accepted as aliases for
+`obscure2`, and `x360` and `xbox` for `xbox360`.
 
 The Final Exam pool cipher is reversible without a key: the keystream depends
 only on the node, attribute and pool counts stored in the header.
@@ -181,7 +182,7 @@ character from `code` when the stored bytes are exactly that truncated tail, and
   references (a null entry with name CRC `0`): PC 18 of 38 files, PS2 17 of 34,
   PSP 15 of 37 and Wii 20 of 39. It is not reproduced, so those rebuilt files
   are exactly 8 bytes shorter. Final Exam has the same dead record in 208 of its
-  382 files.
+  382 PC files and 209 of its 382 Xbox 360 files.
 - Nodes without attributes keep a stale `first_attr` value in the shipped files.
   A rebuild writes `0` there; the game never reads the field when the attribute
   count is `0`.
@@ -192,6 +193,12 @@ character from `code` when the stored bytes are exactly that truncated tail, and
   node ordering can differ, because the shipped files do not follow a single
   traversal order and the game addresses nodes by index. All 382 shipped Final
   Exam files keep an identical XML tree.
+- Xbox 360 Final Exam uses the same container in big-endian with a 32-bit
+  `first_attr`. All 382 shipped files are XML-stable and keep an identical XML
+  tree; 23 rebuild byte-for-byte, while the rest differ in node/attribute
+  ordering and stale `first_attr` fields (the game addresses nodes by index),
+  and 209 also drop the dead record. No new tag or attribute names are needed:
+  the Xbox 360 files use exactly the same CRC set as the PC release.
 - Wii files keep their node records byte-for-byte (tag, parent, child and
   attribute counts), but the attribute table is rewritten in node order: the
   shipped files scatter it, so only 5 of 39 are already in order. The tree is
