@@ -23,6 +23,9 @@ const FE_POOL_KEY: u32 = 0x4961_6E42;
 /// Markers written into the XML so `build` can pick the right container back.
 const FE_FORMAT_MARKER: &str = "<!-- xmc-format: final-exam -->";
 const XBOX360_FORMAT_MARKER: &str = "<!-- xmc-format: xbox360 -->";
+/// Accepted on build only: PS3 and Xbox 360 share the same container, so
+/// `extract` always writes the `xbox360` marker.
+const PS3_FORMAT_MARKER: &str = "<!-- xmc-format: ps3 -->";
 const WII_FORMAT_MARKER: &str = "<!-- xmc-format: wii -->";
 
 /// Container format of an `.xmc` file.
@@ -39,9 +42,11 @@ enum XmcFormat {
     Wii,
     /// Final Exam style container.
     FinalExam,
-    /// Final Exam on Xbox 360: same container as Final Exam, but big-endian and
-    /// with a 32-bit `first_attr` instead of the trailing 16-bit padding.
-    #[value(name = "xbox360", alias = "x360", alias = "xbox")]
+    /// Final Exam on Xbox 360 and PS3: same container as Final Exam, but
+    /// big-endian and with a 32-bit `first_attr` instead of the trailing 16-bit
+    /// padding. Both consoles ship byte-compatible files, so one layout covers
+    /// them.
+    #[value(name = "xbox360", alias = "x360", alias = "xbox", alias = "ps3", alias = "playstation3")]
     Xbox360,
 }
 
@@ -960,7 +965,7 @@ fn xml_to_xmc(
         XmcFormat::Auto => {
             if text.contains(FE_FORMAT_MARKER) {
                 XmcFormat::FinalExam
-            } else if text.contains(XBOX360_FORMAT_MARKER) {
+            } else if text.contains(XBOX360_FORMAT_MARKER) || text.contains(PS3_FORMAT_MARKER) {
                 XmcFormat::Xbox360
             } else if text.contains(WII_FORMAT_MARKER) {
                 XmcFormat::Wii

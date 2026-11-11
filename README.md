@@ -1,14 +1,14 @@
 # Obscure XMC Converter
 A CLI tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 1/2
-(PC, PS2, Wii and PSP) and Final Exam (PC and Xbox 360), which share the same
-XML vocabulary in four different binary containers.
+(PC, PS2, Wii and PSP) and Final Exam (PC, Xbox 360 and PS3), which share the
+same XML vocabulary in four different binary containers.
 
 ## Supported Versions
 
-| Game                     | PC     | PS2    | Wii     | PSP    | Xbox 360 |
-|--------------------------|:------:|:------:|:-------:|:------:|:--------:|
-| Obscure 2                |   ✅   |   ✅   |   ✅   |   ✅  |          |
-| Final Exam               |   ✅   |        |         |        |    ✅    |
+| Game                     | PC     | PS2    | Wii     | PSP    | Xbox 360 | PS3    |
+|--------------------------|:------:|:------:|:-------:|:------:|:--------:|:------:|
+| Obscure 2                |   ✅   |   ✅   |   ✅   |   ✅  |          |        |
+| Final Exam               |   ✅   |        |         |        |    ✅    |   ✅   |
 
 # How to Compile
 ## Windows
@@ -104,12 +104,19 @@ and Final Exam files.
 
 There are four layouts, all detected automatically:
 
-| | Obscure 1/2 (PC/PS2/PSP) | Obscure 2 (Wii) | Final Exam (PC) | Final Exam (Xbox 360) |
+| | Obscure 1/2 (PC/PS2/PSP) | Obscure 2 (Wii) | Final Exam (PC) | Final Exam (Xbox 360/PS3) |
 |---|---|---|---|---|
 | Byte order | little-endian | **big-endian** | little-endian | **big-endian** |
 | Header | 12 bytes (`u32` node/attr/string counts) | same | 17 bytes (`u32` magic `0x66`, `u8` version `3`, three 24-bit counts) | 17 bytes, same fields with full 32-bit counts |
 | Node | 16 bytes: `first_attr` is `u16`, then `u16` padding | 16 bytes: `first_attr` is a full `u32` | 20 bytes: adds `u16` padding and `u32` `0xFFFFFFFF` | 20 bytes: `first_attr` is a full `u32`, then `u32` `0xFFFFFFFF` |
 | String pool | plain CP1252 | plain CP1252 | encrypted with a keystream derived from the three counts | same cipher as PC |
+
+The Xbox 360 and PS3 releases of Final Exam ship byte-compatible files: the
+same big-endian container, node records and encrypted pool. Of the 382 shipped
+files, 379 are byte-identical between the two consoles; only the platform
+button fonts and `load.hvp/common/platform_utility/config.xmc` differ in
+content, not layout. One layout therefore covers both, and `ps3` is an alias of
+`xbox360`.
 
 The PS2 and PSP releases of Obscure 2 use the same container as the PC release:
 little-endian, 12-byte header, 16-byte nodes with a `u16` `first_attr` and `u16`
@@ -121,12 +128,14 @@ padding (always `0`), and a plain string pool. All 34 shipped PS2 files and all
 (either byte order), and a Wii file is a big-endian Obscure header whose counts
 add up to the file size. `build` reads the `<!-- xmc-format: ... -->` comment
 that `extract` writes (`wii`, `final-exam` or `xbox360`) and falls back to the
-Obscure 1/2 layout for XML that has no such marker.
+Obscure 1/2 layout for XML that has no such marker. PS3 and Xbox 360 files are
+indistinguishable at the container level, so `extract` writes the `xbox360`
+marker for both; `build` also accepts a hand-written `<!-- xmc-format: ps3 -->`.
 
 `--format auto` is the default; `--format obscure2` (PC/PS2/PSP), `--format wii`,
 `--format final-exam` and `--format xbox360` force one layout (useful for XML
 files written by hand). `pc`, `ps2` and `psp` are accepted as aliases for
-`obscure2`, and `x360` and `xbox` for `xbox360`.
+`obscure2`; `x360`, `xbox`, `ps3` and `playstation3` are aliases for `xbox360`.
 
 The Final Exam pool cipher is reversible without a key: the keystream depends
 only on the node, attribute and pool counts stored in the header.
@@ -199,6 +208,11 @@ character from `code` when the stored bytes are exactly that truncated tail, and
   ordering and stale `first_attr` fields (the game addresses nodes by index),
   and 209 also drop the dead record. No new tag or attribute names are needed:
   the Xbox 360 files use exactly the same CRC set as the PC release.
+- PS3 Final Exam shares the Xbox 360 container, so it uses the same code path.
+  All 382 shipped files are XML-stable and keep an identical XML tree; 23
+  rebuild byte-for-byte, with the same node/attribute ordering and dead-record
+  differences as Xbox 360. The PS3 CRC set is also identical to the PC and
+  Xbox 360 releases.
 - Wii files keep their node records byte-for-byte (tag, parent, child and
   attribute counts), but the attribute table is rewritten in node order: the
   shipped files scatter it, so only 5 of 39 are already in order. The tree is
