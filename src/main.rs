@@ -29,8 +29,9 @@ const WII_FORMAT_MARKER: &str = "<!-- xmc-format: wii -->";
 enum XmcFormat {
     /// Detect from the file when extracting, or from the XML marker when building.
     Auto,
-    /// Obscure 1/2 style container (little-endian); the PC and PSP releases
-    /// use this layout.
+    /// Obscure 1/2 style container (little-endian); the PC, PS2 and PSP
+    /// releases use this layout.
+    #[value(alias = "pc", alias = "ps2", alias = "psp")]
     Obscure2,
     /// Obscure 2 on Wii: same layout as Obscure 2, but big-endian and with a
     /// 32-bit `first_attr` instead of the trailing 16-bit padding.
@@ -176,7 +177,7 @@ mod text {
     name = "obscure-xmc-converter",
     version,
     about = "Convert between Obscure 1/2 and Final Exam XMC and XML",
-    long_about = "Extract XMC files (Obscure 1/2 on PC, Wii and PSP, and Final Exam) to XML or build XMC files from XML."
+    long_about = "Extract XMC files (Obscure 1/2 on PC, PS2, Wii and PSP, and Final Exam) to XML or build XMC files from XML."
 )]
 struct Args {
     #[command(subcommand)]
@@ -982,10 +983,17 @@ fn xml_to_xmc(
 fn encode_obscure2(
     nodes: &[XmcNode],
     attrs: &[XmcAttribute],
-    pool: Vec<u8>,
+    mut pool: Vec<u8>,
     endian: Endian,
     debug: bool,
 ) -> Result<Vec<u8>> {
+    // The shipped pools (PC, PS2, PSP and Wii) are zero-padded to a 16-byte
+    // boundary. The padding is not referenced by any attribute, but keeping it
+    // makes a rebuilt file match the shipped layout byte for byte whenever the
+    // original did not use string sharing.
+    let padded = (pool.len() + 15) / 16 * 16;
+    pool.resize(padded, 0);
+
     let node_count = u32::try_from(nodes.len()).context("Too many nodes")?;
     let attr_count = u32::try_from(attrs.len()).context("Too many attributes")?;
     let pool_size = u32::try_from(pool.len()).context("String pool too large")?;
