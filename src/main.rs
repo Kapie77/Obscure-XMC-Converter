@@ -29,7 +29,8 @@ const WII_FORMAT_MARKER: &str = "<!-- xmc-format: wii -->";
 enum XmcFormat {
     /// Detect from the file when extracting, or from the XML marker when building.
     Auto,
-    /// Obscure 1/2 style container (little-endian).
+    /// Obscure 1/2 style container (little-endian); the PC and PSP releases
+    /// use this layout.
     Obscure2,
     /// Obscure 2 on Wii: same layout as Obscure 2, but big-endian and with a
     /// 32-bit `first_attr` instead of the trailing 16-bit padding.
@@ -175,7 +176,7 @@ mod text {
     name = "obscure-xmc-converter",
     version,
     about = "Convert between Obscure 1/2 and Final Exam XMC and XML",
-    long_about = "Extract XMC files (Obscure 1/2 and Final Exam) to XML or build XMC files from XML."
+    long_about = "Extract XMC files (Obscure 1/2 on PC, Wii and PSP, and Final Exam) to XML or build XMC files from XML."
 )]
 struct Args {
     #[command(subcommand)]

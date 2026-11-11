@@ -1,7 +1,14 @@
 # Obscure XMC Converter
 A CLI tool for converting .xmc to .xml — and .xml to .xmc — from Obscure 1/2
-(PC and Wii) and Final Exam, which share the same XML vocabulary in three
+(PC, Wii and PSP) and Final Exam, which share the same XML vocabulary in three
 different binary containers.
+
+## Supported Versions
+
+| Game                     | PC     | Wii     | PSP    |
+|--------------------------|:------:|:-------:|:------:|
+| Obscure 2                |   ✅   |   ✅   |   ✅  |
+| Final Exam               |   ✅   |         |        |
 
 # How to Compile
 ## Windows
@@ -88,7 +95,8 @@ and Final Exam files.
 
 ## Notes
 
-- The Obscure binary format is little-endian on PC and big-endian on Wii, with a 12-byte header, 16-byte node records, and 8-byte attributes.
+- The Obscure binary format is little-endian on PC and PSP and big-endian on
+  Wii, with a 12-byte header, 16-byte node records, and 8-byte attributes.
 - The format described does not represent XML text as node content; this conversion also preserves only elements and attributes.
 - The XML-to-XMC conversion is a reconstruction of the format; it does not guarantee that the resulting bytes will be identical to those in the original file. Test on copies of the files and verify them in the game before replacing any files.
 
@@ -103,13 +111,19 @@ There are three layouts, all detected automatically:
 | Node | 16 bytes: `first_attr` is `u16`, then `u16` padding | 16 bytes: `first_attr` is a full `u32` | 20 bytes: adds `u16` padding and `u32` `0xFFFFFFFF` |
 | String pool | plain CP1252 | plain CP1252 | encrypted with a keystream derived from the three counts |
 
+The PSP release of Obscure 2 uses the same container as the PC release: little-
+endian, 12-byte header, 16-byte nodes with a `u16` `first_attr` and `u16`
+padding (always `0`), and a plain string pool. All 37 shipped PSP files match
+this layout, so they need no separate format flag — `auto` and `obscure2` both
+handle them.
+
 `extract` sniffs the file: Final Exam is recognised by its magic and exact size,
 and a Wii file is a big-endian Obscure header whose counts add up to the file
 size. `build` reads the `<!-- xmc-format: ... -->` comment that `extract` writes
 (`wii` or `final-exam`) and falls back to the Obscure 1/2 layout for XML that
 has no such marker.
 
-`--format auto` is the default; `--format obscure2`, `--format wii` and
+`--format auto` is the default; `--format obscure2` (PC/PSP), `--format wii` and
 `--format final-exam` force one layout (useful for XML files written by hand).
 
 The Final Exam pool cipher is reversible without a key: the keystream depends
@@ -124,8 +138,13 @@ attributes, which is why the Wii layout needs its own branch.
 
 `hashes.json` maps tag/attribute name CRC32s to names. Unknown names are written
 as `tag_XXXXXXXX` / `attr_XXXXXXXX` and round-trip unchanged, so a missing name
-never loses data. 59 CRCs used by the shipped files are still unnamed, including
-the root tag of the font files.
+never loses data. 60 CRCs used by the shipped files are still unnamed (51 of them
+Final Exam-only), including the root tag of the font files.
+
+The PSP port adds a handful of attributes that do not exist in the PC release
+(`healType`, `healID`, `color0`, `color1`, `x0`, `y0`, `item_x1`, `item_x2`,
+`item_y`, `item_dy`, `no_weap`, `show_quantity`); their names are included in
+`hashes.json`.
 
 ## Text encoding
 
@@ -137,7 +156,7 @@ into `�` (U+FFFD).
   CP1252 otherwise, so `é`, `à`, `°`, `œ`, `€` and friends come out correctly.
 - `build` writes CP1252 when every character fits, and UTF-8 otherwise.
 - `--encoding cp1252` forces CP1252 and `--encoding utf8` forces UTF-8.
-  Almost every shipped file is CP1252, on PC and Wii alike, including the
+  Almost every shipped file is CP1252, on PC, Wii and PSP alike, including the
   dialogue and the `font_nonserif12`/`font_smallfonts7` glyph tables.
   `font_arial14b.xmc` is the one exception: it stores its glyphs as UTF-8, so
   extracting and rebuilding it without edits converts them to CP1252 (same
@@ -171,5 +190,9 @@ character from `code` when the stored bytes are exactly that truncated tail, and
   attribute counts), but the attribute table is rewritten in node order: the
   shipped files scatter it, so only 5 of 39 are already in order. The tree is
   unchanged; all 39 keep an identical XML tree.
+- PSP files use the PC layout, so their node records and attribute table order
+  are kept as shipped. All 37 are XML-stable, and 36 of 37 keep an identical
+  XML tree, with the same `font_arial14b.xmc` UTF-8-to-CP1252 caveat as PC and
+  Wii.
 
 
